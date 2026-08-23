@@ -1,0 +1,25 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.godhelpme/
+venv/
+.venv/
+
+# env / secrets
+.env
+.env.*
+!.env.example
+*serviceAccountKey*.json
+*firebase-adminsdk*.json
+
+# Node / frontend
+node_modules/
+dist/
+build/
+.pnp
+.pnp.js
+coverage/
