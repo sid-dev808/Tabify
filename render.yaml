@@ -12,7 +12,7 @@ services:
       - key: FRONTEND_URL
         value: https://my-app-frontend.onrender.com
       - key: PYTHON_VERSION
-        value: 3.11.9
+        value: 3.10.4
 
   # --- Frontend: React Static Site ---
   - type: web
