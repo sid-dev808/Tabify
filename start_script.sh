@@ -70,15 +70,32 @@ say "${DIM}───────────────────────
 if [ "$WANT_BACKEND" = 1 ]; then
   [ -d backend ] || die "No backend/ directory here. Run this from the Tabify repo root."
 
-  # Find an existing virtualenv, or make one.
+  # Find an existing virtualenv, or make one. A venv copied between machines
+  # (or between macOS and Linux) keeps its directory but its python symlink
+  # dangles, so check that the interpreter actually runs rather than that the
+  # folder exists.
   VENV=""
+  UNUSABLE=""
   for candidate in backend/.godhelpme backend/.venv backend/venv; do
-    [ -x "$candidate/bin/python" ] && VENV="$candidate" && break
+    if [ -x "$candidate/bin/python" ]; then
+      VENV="$candidate"
+      break
+    elif [ -d "$candidate" ]; then
+      UNUSABLE="$UNUSABLE $candidate"
+    fi
   done
 
   if [ -z "$VENV" ]; then
-    warn "No virtualenv found — creating backend/.venv (first run takes a few minutes)"
-    python3 -m venv backend/.venv || die "Couldn't create a virtualenv. Is python3 installed?"
+    if [ -n "$UNUSABLE" ]; then
+      warn "Found a virtualenv at$UNUSABLE, but its python won't run on this machine."
+      warn "That usually means it was built elsewhere (another OS, or a moved folder)."
+      warn "Delete it and re-run with --install to rebuild."
+    fi
+    warn "Creating backend/.venv (first run takes a few minutes)"
+    if ! python3 -m venv backend/.venv; then
+      rm -rf backend/.venv 2>/dev/null
+      die "Couldn't create a virtualenv. Install python3 with venv support (macOS: brew install python@3.11), then run ./start_script.sh --install"
+    fi
     VENV="backend/.venv"
     DO_INSTALL=1
   fi

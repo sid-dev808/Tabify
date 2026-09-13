@@ -64,6 +64,19 @@ Then fill in `frontend/.env.local` from that block:
 
 ## Part 2 — Running it
 
+**The short version:**
+
+```bash
+./start_script.sh
+```
+
+That starts both servers, waits for the transcription model to load, and prints
+the URL to open. Ctrl-C stops everything. First run on a fresh clone:
+`./start_script.sh --install`.
+
+<details>
+<summary>Or run the two servers by hand</summary>
+
 Two servers, two terminals.
 
 **Terminal 1 — backend (transcription):**
@@ -83,8 +96,10 @@ npm install                        # first time only
 npm run dev                        # serves http://localhost:5173
 ```
 
+</details>
+
 Open the frontend URL. The dashboard warns you if it can't reach the backend,
-so you'll know immediately if terminal 1 isn't running.
+so you'll know immediately if it isn't running.
 
 ---
 

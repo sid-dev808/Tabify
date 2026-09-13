@@ -101,6 +101,9 @@ INSTRUMENT_FREQUENCY_BOUNDS = {
 JOBS = {}
 JOBS_LOCK = threading.Lock()
 JOB_TTL_SECONDS = 60 * 60  # temp files older than an hour are swept
+# basic-pitch is slow; a long upload would tie up the single worker and
+# time out the request anyway, so refuse it up front with a clear reason.
+MAX_CLIP_SECONDS = 5 * 60
 
 
 def purge_expired_jobs():
@@ -169,6 +172,33 @@ def transcribe():
     if os.path.getsize(input_path) == 0:
         job_dir.cleanup()
         return jsonify({"detail": "The recording came through empty. Please try again."}), 400
+
+    # Probe the file before handing it to the model. Decoding one second is
+    # cheap and turns "Transcription failed: <library stack trace>" into
+    # something the person who uploaded the file can act on.
+    try:
+        probe, probe_sr = librosa.load(input_path, sr=None, mono=True, duration=1.0)
+    except Exception:
+        job_dir.cleanup()
+        return jsonify({
+            "detail": "Couldn't read that audio file. Try converting it to WAV or M4A and uploading again."
+        }), 400
+
+    if probe.size == 0:
+        job_dir.cleanup()
+        return jsonify({"detail": "That audio file appears to be silent or empty."}), 400
+
+    try:
+        clip_seconds = librosa.get_duration(path=input_path)
+    except Exception:
+        clip_seconds = 0.0
+
+    if clip_seconds > MAX_CLIP_SECONDS:
+        job_dir.cleanup()
+        return jsonify({
+            "detail": f"That clip is {clip_seconds / 60:.1f} minutes long. "
+                      f"Please keep takes under {MAX_CLIP_SECONDS // 60} minutes."
+        }), 400
 
     min_freq, max_freq = INSTRUMENT_FREQUENCY_BOUNDS.get(instrument, (None, None))
 
