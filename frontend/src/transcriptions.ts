@@ -4,6 +4,7 @@ import {
   doc,
   getDocs,
   onSnapshot,
+  updateDoc,
   orderBy,
   query,
   serverTimestamp,
@@ -35,6 +36,8 @@ export interface TranscriptionInput {
   durationSeconds: number;
   color: string;
   notes: StoredNote[];
+  /** Detected tempo, so a reopened project shows the same bar lines. */
+  bpm: number;
 }
 
 export interface TranscriptionRecord extends TranscriptionInput {
@@ -79,7 +82,12 @@ function toRecord(id: string, data: Record<string, unknown>): TranscriptionRecor
     notes: (data.notes as StoredNote[]) ?? [],
     noteCount: (data.noteCount as number) ?? ((data.notes as StoredNote[]) ?? []).length,
     createdAtMs: (data.createdAtMs as number) ?? 0,
+    bpm: (data.bpm as number) ?? 120,
   };
+}
+
+export async function renameTranscription(uid: string, id: string, name: string) {
+  await updateDoc(doc(db, "users", uid, "transcriptions", id), { name: name.trim() || "Untitled" });
 }
 
 /** Live list of the user's saved transcriptions; returns an unsubscribe fn. */

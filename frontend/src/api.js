@@ -32,10 +32,12 @@ async function toError(response) {
   return new Error(detail);
 }
 
-/** POST the recorded audio and get back { job_id, notes, duration }. */
-export async function transcribeRecording(audioBlob, instrument) {
+/** POST the recorded audio and get back { job_id, notes, duration }.
+    `filename` matters: the backend decodes by extension, so an uploaded .mp3
+    must not arrive labelled .webm. */
+export async function transcribeRecording(audioBlob, instrument, filename = "recording.webm") {
   const formData = new FormData();
-  formData.append("file", audioBlob, "recording.webm");
+  formData.append("file", audioBlob, filename);
   if (instrument) formData.append("instrument", instrument);
 
   let response;
