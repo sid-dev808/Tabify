@@ -1,29 +1,32 @@
 services:
   # --- Backend: Flask Web Service ---
   - type: web
-    name: my-app-backend
+    name: tabify-backend
     runtime: python
     rootDir: backend
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "gunicorn app:app"
+    # One worker only: transcription jobs are held in this process's memory,
+    # so a second worker would not see jobs created by the first. Threads give
+    # concurrency for downloads; the long timeout covers slow transcriptions.
+    startCommand: "gunicorn app:app --workers 1 --threads 4 --timeout 300"
     envVars:
       - key: FIREBASE_SERVICE_ACCOUNT_JSON
         sync: false          # set manually in dashboard (secret)
       - key: FRONTEND_URL
-        value: https://my-app-frontend.onrender.com
+        value: https://tabify-frontend.onrender.com
       - key: PYTHON_VERSION
         value: 3.10.4
 
   # --- Frontend: React Static Site ---
   - type: web
-    name: my-app-frontend
+    name: tabify-frontend
     runtime: static
     rootDir: frontend
     buildCommand: "npm install && npm run build"
-    staticPublishPath: ./dist    # use ./build if Create React App, ./dist if Vite
+    staticPublishPath: ./dist
     envVars:
       - key: VITE_API_URL
-        value: https://my-app-backend.onrender.com
+        value: https://tabify-backend.onrender.com
       - key: VITE_FIREBASE_API_KEY
         sync: false
       - key: VITE_FIREBASE_AUTH_DOMAIN
