@@ -1,3 +1,4 @@
+# ── web ──
 Flask
 flask-cors
 gunicorn
@@ -5,10 +6,21 @@ Werkzeug
 firebase-admin
 python-dateutil
 requests
+
+# ── audio / transcription ──
 numpy
 scipy
 librosa
-basic-pitch
+soundfile
 pretty_midi
 mir_eval
-soundfile
+basic-pitch
+
+# Transcription runtime. basic-pitch does not install a usable one on every
+# platform: on Linux with Python < 3.11 it pulls tflite-runtime, whose wheel is
+# built against NumPy 1.x and cannot load a model under NumPy 2 (the
+# "_ARRAY_API not found" / "nmp.tflite cannot be loaded" failure on Render).
+# onnxruntime works identically on macOS and Linux and is NumPy-2 clean, so
+# app.py selects it explicitly. Keep this pinned here even though basic-pitch
+# does not ask for it.
+onnxruntime

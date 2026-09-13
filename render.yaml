@@ -14,6 +14,10 @@ services:
         sync: false          # set manually in dashboard (secret)
       - key: FRONTEND_URL
         value: https://tabify-frontend.onrender.com
+      # Stay on 3.10: basic-pitch makes TensorFlow (~600 MB) a hard dependency
+      # on Linux from 3.11 up, which would blow this service's build and memory
+      # budget. On 3.10 it pulls the small tflite-runtime instead, which app.py
+      # ignores in favour of onnxruntime.
       - key: PYTHON_VERSION
         value: 3.10.4
 

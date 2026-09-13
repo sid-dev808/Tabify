@@ -2,17 +2,21 @@ import json
 import os
 import threading
 import time
-
-os.environ["BASIC_PITCH_BACKEND"] = "torch"
-
 import tempfile
 import uuid
 from functools import wraps
 
 import librosa
 import soundfile as sf
-from basic_pitch.inference import predict
-from basic_pitch import ICASSP_2022_MODEL_PATH
+from basic_pitch import (
+    CT_PRESENT,
+    ONNX_PRESENT,
+    TFLITE_PRESENT,
+    TF_PRESENT,
+    FilenameSuffix,
+    build_icassp_2022_model_path,
+)
+from basic_pitch.inference import Model, predict
 from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 
@@ -101,6 +105,9 @@ INSTRUMENT_FREQUENCY_BOUNDS = {
 JOBS = {}
 JOBS_LOCK = threading.Lock()
 JOB_TTL_SECONDS = 60 * 60  # temp files older than an hour are swept
+# basic-pitch is slow and this service runs a single worker, so a long upload
+# would tie it up and time out the request anyway. Refuse it up front instead.
+MAX_CLIP_SECONDS = 5 * 60
 
 
 def purge_expired_jobs():
@@ -128,6 +135,68 @@ def get_owned_job(job_id):
     return job, None
 
 
+# ─── TRANSCRIPTION MODEL ───
+# basic-pitch does NOT let you ask for a runtime. It picks one at import time
+# from whichever of TensorFlow / CoreML / TFLite / ONNX happens to be installed,
+# and which of those gets installed is decided by its own dependency markers:
+#
+#     macOS            -> coremltools     (CoreML)
+#     Linux, py < 3.11 -> tflite-runtime  (TFLite)
+#     Linux, py >= 3.11-> tensorflow      (TF, ~600 MB)
+#
+# That is why this worked locally on a Mac and failed on Render: the Linux box
+# resolved to tflite-runtime, whose C extension is compiled against NumPy 1.x
+# and raises "_ARRAY_API not found" the moment you build an Interpreter under
+# NumPy 2. basic-pitch swallows that and reports the confusing
+# "nmp.tflite cannot be loaded into either TensorFlow, CoreML, TFLite or ONNX".
+#
+# So we choose the runtime ourselves, preferring ONNX: it is the one backend
+# that behaves identically on every platform we run on, it is NumPy-2 clean,
+# it loads in milliseconds, and its model file ships inside the package.
+# Set BASIC_PITCH_BACKEND to force a specific one (onnx / coreml / tflite / tf).
+BACKEND_PREFERENCE = [
+    ("onnx", FilenameSuffix.onnx, ONNX_PRESENT),
+    ("coreml", FilenameSuffix.coreml, CT_PRESENT),
+    ("tflite", FilenameSuffix.tflite, TFLITE_PRESENT),
+    ("tf", FilenameSuffix.tf, TF_PRESENT),
+]
+
+
+def load_transcription_model():
+    """Return (model, backend_name, failure_notes). Never raises."""
+    forced = os.environ.get("BASIC_PITCH_BACKEND", "").strip().lower()
+    # A forced backend goes first; sorted() is stable so the rest keep their order.
+    candidates = sorted(BACKEND_PREFERENCE, key=lambda entry: 0 if entry[0] == forced else 1)
+
+    notes = []
+    for name, suffix, installed in candidates:
+        if not installed:
+            notes.append(f"{name}: runtime not installed")
+            continue
+        path = build_icassp_2022_model_path(suffix)
+        if not path.exists():
+            notes.append(f"{name}: model file missing ({path})")
+            continue
+        try:
+            model = Model(path)
+        except Exception as exc:  # noqa: BLE001 - try the next backend instead
+            notes.append(f"{name}: {type(exc).__name__}: {exc}")
+            continue
+        print(f"[tabify] transcription backend: {name} ({path.name})")
+        return model, name, notes
+
+    print("[tabify] NO TRANSCRIPTION BACKEND AVAILABLE:")
+    for note in notes:
+        print(f"[tabify]   - {note}")
+    print("[tabify] fix: add 'onnxruntime' to backend/requirements.txt and redeploy")
+    return None, None, notes
+
+
+# Loaded once at boot rather than per request, so a misconfigured deploy fails
+# visibly in the logs instead of on someone's first upload.
+MODEL, MODEL_BACKEND, MODEL_NOTES = load_transcription_model()
+
+
 def midi_note_to_name(midi_num):
     names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
     name = names[int(round(midi_num)) % 12]
@@ -141,6 +210,9 @@ def health():
         "ok": True,
         "auth_required": _firebase_auth is not None,
         "active_jobs": len(JOBS),
+        "model_ready": MODEL is not None,
+        "model_backend": MODEL_BACKEND,
+        "model_notes": None if MODEL is not None else MODEL_NOTES,
     })
 
 
@@ -153,6 +225,12 @@ def hello():
 @require_auth
 def transcribe():
     purge_expired_jobs()
+
+    if MODEL is None:
+        return jsonify({
+            "detail": "The transcription model isn't loaded on the server. "
+                      "Check the deploy logs for '[tabify] NO TRANSCRIPTION BACKEND AVAILABLE'."
+        }), 503
 
     if "file" not in request.files:
         return jsonify({"detail": "No audio file uploaded (expected form field 'file')."}), 400
@@ -170,19 +248,51 @@ def transcribe():
         job_dir.cleanup()
         return jsonify({"detail": "The recording came through empty. Please try again."}), 400
 
+    # Decode a single second before handing the file to the model. It is cheap,
+    # and it turns a late, opaque failure (librosa's NoBackendError surfaces with
+    # an empty message, giving "Transcription failed: ") into something the
+    # person who uploaded the file can act on.
+    try:
+        probe, probe_sr = librosa.load(input_path, sr=None, mono=True, duration=1.0)
+    except Exception:  # noqa: BLE001 - any decode failure means the same thing
+        job_dir.cleanup()
+        return jsonify({
+            "detail": "Couldn't read that audio file. "
+                      "Try converting it to WAV or M4A and uploading again."
+        }), 400
+
+    if probe.size < max(1, int((probe_sr or 22050) * 0.05)):
+        job_dir.cleanup()
+        return jsonify({"detail": "That audio file appears to be empty or far too short."}), 400
+
+    try:
+        clip_seconds = librosa.get_duration(path=input_path)
+    except Exception:  # noqa: BLE001 - a missing duration is not fatal
+        clip_seconds = 0.0
+
+    if clip_seconds > MAX_CLIP_SECONDS:
+        job_dir.cleanup()
+        return jsonify({
+            "detail": f"That clip is {clip_seconds / 60:.1f} minutes long. "
+                      f"Please keep takes under {MAX_CLIP_SECONDS // 60} minutes."
+        }), 400
+
     min_freq, max_freq = INSTRUMENT_FREQUENCY_BOUNDS.get(instrument, (None, None))
 
     try:
         _, midi_data, note_events = predict(
             input_path,
-            ICASSP_2022_MODEL_PATH,
+            MODEL,
             minimum_frequency=min_freq,
             maximum_frequency=max_freq,
             melodia_trick=True,
         )
     except Exception as exc:  # noqa: BLE001
         job_dir.cleanup()
-        return jsonify({"detail": f"Transcription failed: {exc}"}), 500
+        # NoBackendError and friends stringify to "", which used to produce the
+        # useless message "Transcription failed: ".
+        reason = str(exc).strip() or type(exc).__name__
+        return jsonify({"detail": f"Transcription failed: {reason}"}), 500
 
     notes = [
         {

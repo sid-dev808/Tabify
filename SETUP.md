@@ -155,3 +155,44 @@ Settings → **Authorized domains**, or sign-in will be rejected in production.
 > The backend keeps transcription jobs in process memory, which is why the start
 > command pins `--workers 1`. Raising the worker count would send a download to a
 > process that never saw the job.
+
+### Which transcription runtime gets used
+
+basic-pitch does not let you request a runtime — it picks one when it is
+imported, based on whichever of TensorFlow / CoreML / TFLite / ONNX its own
+dependency markers happened to install:
+
+| Platform | What basic-pitch installs | Result |
+| --- | --- | --- |
+| macOS | `coremltools` | CoreML — works |
+| Linux, Python < 3.11 | `tflite-runtime` | **broken under NumPy 2** |
+| Linux, Python ≥ 3.11 | `tensorflow` (~600 MB) | works, but too big for this service |
+
+The Linux/3.10 combination is what Render uses, and `tflite-runtime`'s wheel is
+compiled against NumPy 1.x. Under NumPy 2 it fails with `_ARRAY_API not found`,
+which basic-pitch reports as:
+
+> `File .../nmp.tflite cannot be loaded into either TensorFlow, CoreML, TFLite or
+> ONNX. ... On this system, ['TensorFlowLite'] is installed.`
+
+`backend/requirements.txt` therefore adds **`onnxruntime`**, and `app.py` selects
+the ONNX model explicitly rather than trusting the automatic choice. ONNX behaves
+identically on macOS and Linux, is NumPy-2 clean, and loads in milliseconds.
+
+**Check which runtime a deploy is using:** `GET /api/health` returns
+`model_backend` and `model_ready`. The startup log prints
+`[tabify] transcription backend: onnx (nmp.onnx)`. If no backend loads at all the
+log prints `[tabify] NO TRANSCRIPTION BACKEND AVAILABLE` with the reason per
+runtime, and `/api/transcribe` returns a 503 saying so instead of failing
+mid-upload.
+
+**Keep `PYTHON_VERSION` at 3.10.** On 3.11+ basic-pitch makes TensorFlow a hard
+dependency on Linux, which would bloat the build and the memory footprint. If the
+service was created by hand rather than from `render.yaml`, set that variable in
+the Render dashboard yourself.
+
+> Measured footprint with ONNX: ~360 MB RSS at peak, and 0.3–0.8 s of inference
+> for a 5–30 second clip once warm. That fits Render's 512 MB free tier, but not
+> with much room — if you start seeing out-of-memory restarts, that is the number
+> to look at first. The very first transcription after a deploy is slow (~15 s)
+> because librosa and its JIT warm up.
