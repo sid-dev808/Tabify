@@ -1,12 +1,14 @@
 import json
 import os
+import re
+import shutil
+import subprocess
 import threading
 import time
 import tempfile
 import uuid
 from functools import wraps
 
-import librosa
 import soundfile as sf
 from basic_pitch import (
     CT_PRESENT,
@@ -26,18 +28,36 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024  # 32 MB
 
 # ─── CORS ───
-# In production only the deployed frontend may call this API; the local Vite
-# dev server origins stay allowed so development keeps working unchanged.
+# The browser will not read a response that lacks Access-Control-Allow-Origin,
+# so an unset FRONTEND_URL turns every API call into an opaque "CORS policy"
+# error in the console. Set FRONTEND_URL (comma-separated is fine) to lock this
+# down; if it is missing we still accept Render-hosted frontends rather than
+# silently blocking the deployment, and say so in the log.
 DEV_ORIGINS = [
     "http://localhost:5173",
-    "https://tabify-frontend.onrender.com",
-    "https://tabify-backend-6n5q.onrender.com",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
     "http://127.0.0.1:3000",
 ]
-ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("FRONTEND_URL", "").split(",") if o.strip()]
+RENDER_ORIGIN = re.compile(r"^https://[A-Za-z0-9-]+\.onrender\.com$")
+
+CONFIGURED_ORIGINS = [
+    origin.strip().rstrip("/")
+    for origin in os.environ.get("FRONTEND_URL", "").split(",")
+    if origin.strip()
+]
+
+if CONFIGURED_ORIGINS:
+    CORS_ORIGINS = CONFIGURED_ORIGINS + DEV_ORIGINS
+    print(f"[tabify] CORS: allowing {CONFIGURED_ORIGINS} plus local dev origins")
+else:
+    CORS_ORIGINS = DEV_ORIGINS + [RENDER_ORIGIN]
+    print("[tabify] CORS: FRONTEND_URL is not set - allowing any *.onrender.com "
+          "origin plus local dev. Set FRONTEND_URL to restrict this.")
+
 CORS(
     app,
-    resources={r"/api/*": {"origins": ALLOWED_ORIGINS + DEV_ORIGINS}},
+    resources={r"/api/*": {"origins": CORS_ORIGINS}},
     allow_headers=["Content-Type", "Authorization"],
     methods=["GET", "POST", "DELETE", "OPTIONS"],
 )
@@ -135,6 +155,74 @@ def get_owned_job(job_id):
     return job, None
 
 
+# ─── AUDIO DECODING ───
+# Everything the app records is WebM/Opus (that is what MediaRecorder produces),
+# and libsndfile cannot read WebM at all. librosa then falls back to audioread,
+# which shells out to ffmpeg — absent from Render's Python image — and spends
+# ~30 seconds discovering that before failing. That is the "Couldn't read that
+# audio file" / 31-second hang seen in production.
+#
+# So we never ask librosa to decode the upload. Every file is transcoded up
+# front to a canonical 22.05 kHz mono PCM WAV with ffmpeg, and only that plain
+# WAV is handed to basic-pitch. ffmpeg comes from the imageio-ffmpeg wheel, so
+# it is a pip dependency rather than a system package Render would have to
+# provide. This also fixes mp3/m4a/aac uploads, which libsndfile cannot read
+# either, and turns a 30-second failure into a 10-millisecond conversion.
+TARGET_SAMPLE_RATE = 22050
+FFMPEG_TIMEOUT_SECONDS = 120
+
+
+def find_ffmpeg():
+    system = shutil.which("ffmpeg")
+    if system:
+        return system, "system"
+    try:
+        import imageio_ffmpeg
+
+        return imageio_ffmpeg.get_ffmpeg_exe(), "imageio-ffmpeg"
+    except Exception as exc:  # noqa: BLE001
+        print(f"[tabify] no ffmpeg available ({exc}); falling back to libsndfile only")
+        return None, None
+
+
+FFMPEG, FFMPEG_SOURCE = find_ffmpeg()
+if FFMPEG:
+    print(f"[tabify] ffmpeg: {FFMPEG} ({FFMPEG_SOURCE})")
+
+
+class AudioDecodeError(Exception):
+    """Raised with a reason worth showing the person who uploaded the file."""
+
+
+def transcode_to_wav(source_path, target_path):
+    """Decode any supported upload into a canonical mono PCM WAV."""
+    if FFMPEG:
+        try:
+            result = subprocess.run(
+                [FFMPEG, "-v", "error", "-y", "-i", source_path,
+                 "-ac", "1", "-ar", str(TARGET_SAMPLE_RATE), "-f", "wav", target_path],
+                capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            raise AudioDecodeError("Decoding took too long. Try a shorter clip.")
+        if result.returncode != 0 or not os.path.exists(target_path) or os.path.getsize(target_path) < 64:
+            detail = (result.stderr or "").strip().splitlines()
+            raise AudioDecodeError(detail[-1][:200] if detail else "ffmpeg could not decode this file")
+        return
+
+    # No ffmpeg: libsndfile handles wav/flac/ogg, and nothing else.
+    try:
+        audio, sample_rate = sf.read(source_path, dtype="float32", always_2d=True)
+    except Exception as exc:  # noqa: BLE001
+        raise AudioDecodeError(f"{type(exc).__name__}: {exc}") from exc
+    sf.write(target_path, audio.mean(axis=1), sample_rate, subtype="PCM_16")
+
+
+def wav_duration_seconds(path):
+    info = sf.info(path)
+    return info.frames / float(info.samplerate or TARGET_SAMPLE_RATE)
+
+
 # ─── TRANSCRIPTION MODEL ───
 # basic-pitch does NOT let you ask for a runtime. It picks one at import time
 # from whichever of TensorFlow / CoreML / TFLite / ONNX happens to be installed,
@@ -216,6 +304,62 @@ def health():
     })
 
 
+@app.route("/api/diagnostics")
+def diagnostics():
+    """What the audio and model stack actually looks like on this box.
+
+    Added because diagnosing the production failure from the browser meant
+    guessing at which of libsndfile / audioread / ffmpeg was missing. Reports
+    versions only — no secrets, no user data.
+    """
+    import platform
+    import sys
+
+    report = {
+        "python": sys.version.split()[0],
+        "platform": platform.platform(),
+        "model_backend": MODEL_BACKEND,
+        "model_ready": MODEL is not None,
+        "ffmpeg": {"path": FFMPEG, "source": FFMPEG_SOURCE, "available": FFMPEG is not None},
+        "soundfile": getattr(sf, "__version__", "unknown"),
+        "libsndfile": getattr(sf, "__libsndfile_version__", "unknown"),
+        "cors_origins": [o if isinstance(o, str) else o.pattern for o in CORS_ORIGINS],
+        "frontend_url_set": bool(CONFIGURED_ORIGINS),
+        "auth_required": _firebase_auth is not None,
+    }
+
+    # Round-trip a tiny tone through the real decode path, so a broken audio
+    # stack shows up here rather than on someone's first upload.
+    try:
+        import math
+        import struct
+
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = os.path.join(tmp, "probe.wav")
+            out = os.path.join(tmp, "out.wav")
+            frames = b"".join(
+                struct.pack("<h", int(math.sin(2 * math.pi * 440 * i / 22050) * 20000))
+                for i in range(4410)
+            )
+            header = (b"RIFF" + struct.pack("<I", 36 + len(frames)) + b"WAVEfmt "
+                      + struct.pack("<IHHIIHH", 16, 1, 1, 22050, 44100, 2, 16)
+                      + b"data" + struct.pack("<I", len(frames)))
+            with open(raw, "wb") as handle:
+                handle.write(header + frames)
+
+            started = time.time()
+            transcode_to_wav(raw, out)
+            report["decode_self_test"] = {
+                "ok": True,
+                "seconds": round(time.time() - started, 3),
+                "duration": round(wav_duration_seconds(out), 3),
+            }
+    except Exception as exc:  # noqa: BLE001
+        report["decode_self_test"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    return jsonify(report)
+
+
 @app.route("/hello")
 def hello():
     return jsonify({"message": "Hello from Flask!"})
@@ -248,27 +392,26 @@ def transcribe():
         job_dir.cleanup()
         return jsonify({"detail": "The recording came through empty. Please try again."}), 400
 
-    # Decode a single second before handing the file to the model. It is cheap,
-    # and it turns a late, opaque failure (librosa's NoBackendError surfaces with
-    # an empty message, giving "Transcription failed: ") into something the
-    # person who uploaded the file can act on.
+    # Convert to a canonical WAV before anything else. basic-pitch reads the
+    # file with librosa, which cannot handle the WebM the recorder produces.
+    canonical_path = os.path.join(job_dir.name, "canonical.wav")
     try:
-        probe, probe_sr = librosa.load(input_path, sr=None, mono=True, duration=1.0)
-    except Exception:  # noqa: BLE001 - any decode failure means the same thing
+        transcode_to_wav(input_path, canonical_path)
+    except AudioDecodeError as exc:
         job_dir.cleanup()
         return jsonify({
-            "detail": "Couldn't read that audio file. "
-                      "Try converting it to WAV or M4A and uploading again."
+            "detail": f"Couldn't read that audio file ({exc}). "
+                      "Try a WAV, MP3 or M4A file."
         }), 400
 
-    if probe.size < max(1, int((probe_sr or 22050) * 0.05)):
-        job_dir.cleanup()
-        return jsonify({"detail": "That audio file appears to be empty or far too short."}), 400
-
     try:
-        clip_seconds = librosa.get_duration(path=input_path)
+        clip_seconds = wav_duration_seconds(canonical_path)
     except Exception:  # noqa: BLE001 - a missing duration is not fatal
         clip_seconds = 0.0
+
+    if clip_seconds < 0.1:
+        job_dir.cleanup()
+        return jsonify({"detail": "That audio file appears to be empty or far too short."}), 400
 
     if clip_seconds > MAX_CLIP_SECONDS:
         job_dir.cleanup()
@@ -281,7 +424,7 @@ def transcribe():
 
     try:
         _, midi_data, note_events = predict(
-            input_path,
+            canonical_path,
             MODEL,
             minimum_frequency=min_freq,
             maximum_frequency=max_freq,
@@ -316,7 +459,7 @@ def transcribe():
             "dir": job_dir,
             "input_path": input_path,
             "midi_path": midi_path,
-            "wav_path": None,
+            "wav_path": canonical_path,
             "uid": getattr(request, "uid", None),
             "created": time.time(),
         }
@@ -339,16 +482,9 @@ def download_wav(job_id):
     job, error = get_owned_job(job_id)
     if error:
         return error
-
-    if not job["wav_path"]:
-        wav_path = os.path.join(job["dir"].name, "recording.wav")
-        try:
-            audio, sr = librosa.load(job["input_path"], sr=None, mono=True)
-            sf.write(wav_path, audio, sr)
-        except Exception as exc:  # noqa: BLE001
-            return jsonify({"detail": f"WAV conversion failed: {exc}"}), 500
-        job["wav_path"] = wav_path
-
+    # Already decoded at upload time, so there is nothing to convert here.
+    if not job["wav_path"] or not os.path.exists(job["wav_path"]):
+        return jsonify({"detail": "That recording is no longer available."}), 404
     return send_file(job["wav_path"], as_attachment=True, download_name="recording.wav")
 
 

@@ -8,6 +8,10 @@ python-dateutil
 requests
 
 # ── audio / transcription ──
+# ffmpeg as a pip dependency. Render's Python image has no ffmpeg, and
+# libsndfile alone cannot read the WebM that browser recording produces (nor
+# mp3/m4a), so without this every upload dies in audioread after ~30 seconds.
+imageio-ffmpeg
 numpy
 scipy
 librosa

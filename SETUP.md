@@ -133,8 +133,11 @@ so you'll know immediately if it isn't running.
 `render.yaml` describes both services. After connecting the repo:
 
 **Backend service** — set these in the dashboard:
-- `FRONTEND_URL` → your deployed frontend URL (this is what CORS allows; without
-  it the browser blocks every API call).
+- `FRONTEND_URL` → your deployed frontend URL, e.g.
+  `https://tabify-frontend.onrender.com`. This is the CORS allowlist. If it is
+  unset the backend falls back to accepting any `*.onrender.com` origin so the
+  deploy still works, and logs that it did — but set it, so only your frontend
+  can call your API.
 - `FIREBASE_SERVICE_ACCOUNT_JSON` → the *entire* JSON from Firebase console →
   Project settings → **Service accounts** → *Generate new private key*, pasted as
   one line.
@@ -155,6 +158,31 @@ Settings → **Authorized domains**, or sign-in will be rejected in production.
 > The backend keeps transcription jobs in process memory, which is why the start
 > command pins `--workers 1`. Raising the worker count would send a download to a
 > process that never saw the job.
+
+### Decoding audio (ffmpeg)
+
+The recorder in the browser produces **WebM/Opus** — that is what `MediaRecorder`
+emits — and libsndfile cannot read WebM at all, nor mp3/m4a. librosa then falls
+back to `audioread`, which shells out to ffmpeg. Render's Python image has no
+ffmpeg, so that search fails after about **30 seconds**, which surfaced as:
+
+> `Couldn't read that audio file` — or, on larger uploads, a dropped connection
+> that the browser reports as `No 'Access-Control-Allow-Origin' header is present`.
+
+(The CORS message was misleading: the request died before a response with CORS
+headers was ever sent.)
+
+`backend/requirements.txt` therefore includes **`imageio-ffmpeg`**, which ships a
+static ffmpeg binary as a pip wheel — no system package for Render to provide.
+`app.py` transcodes every upload to a canonical 22.05 kHz mono WAV before
+basic-pitch sees it, so librosa only ever reads plain PCM. Decoding went from a
+30-second failure to about 10 milliseconds, and mp3/m4a/flac/ogg uploads work too.
+
+**`GET /api/diagnostics`** reports the whole audio and model stack — ffmpeg path
+and source, soundfile/libsndfile versions, the allowed CORS origins, and a decode
+self-test that round-trips a generated tone. Check it first whenever uploads
+misbehave on a deploy; it answers in one request what otherwise takes an hour of
+guessing.
 
 ### Which transcription runtime gets used
 
