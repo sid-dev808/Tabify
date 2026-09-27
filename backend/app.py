@@ -1,7 +1,28 @@
-import json
 import os
+import tempfile as _tempfile
+
+# ─── NUMBA CACHE (must run before anything imports librosa) ───
+# librosa JIT-compiles helpers like _localmax with numba and caches the result
+# inside its own site-packages directory. On Render that path is read-only at
+# runtime, so every worker recompiles from scratch — 14s on a fast machine, far
+# longer on a 0.1-CPU instance — and it eventually fails from deep inside
+# basic-pitch with:
+#     "no compiled object yet for <Library '_localmax' ...>"
+# which is what the 31-second 500s in production actually were. Pointing the
+# cache at writable scratch space makes the compile happen once and load in
+# milliseconds afterwards.
+_NUMBA_CACHE_DIR = os.path.join(_tempfile.gettempdir(), "tabify-numba-cache")
+try:
+    os.makedirs(_NUMBA_CACHE_DIR, exist_ok=True)
+    os.environ.setdefault("NUMBA_CACHE_DIR", _NUMBA_CACHE_DIR)
+except OSError:  # pragma: no cover - scratch space should always be writable
+    _NUMBA_CACHE_DIR = None
+
+import json
+import math
 import re
 import shutil
+import struct
 import subprocess
 import threading
 import time
@@ -284,6 +305,109 @@ def load_transcription_model():
 # visibly in the logs instead of on someone's first upload.
 MODEL, MODEL_BACKEND, MODEL_NOTES = load_transcription_model()
 
+# One inference at a time. This box has a fraction of a CPU and 512 MB, and two
+# concurrent requests both JIT-compiling librosa's numba helpers is exactly how
+# the "_localmax" failure shows up. Serializing costs nothing at this scale.
+INFERENCE_LOCK = threading.Lock()
+
+MODEL_WARM = False
+WARMUP_NOTE = None
+NUMBA_CACHE_RESETS = 0
+
+
+def is_numba_cache_error(exc):
+    """The signature of a numba cache entry that loaded but cannot be reused."""
+    text = f"{type(exc).__name__} {exc}"
+    return ("no compiled object yet" in text
+            or "cannot cache function" in text.lower()
+            or "_GufuncWrapper" in text)
+
+
+def reset_numba_cache():
+    """Throw away the numba cache so the next compile starts clean.
+
+    numba keys cached machine code by CPU features and library versions. An
+    entry written on one machine — Render's build container — can be found and
+    loaded on another with a different CPU, yet not actually apply, which leaves
+    numba trying to re-serialize a library it never compiled. That is exactly
+    the "no compiled object yet for <Library '_GufuncWrapper ...'>" failure.
+    Deleting the cache and recompiling in memory is the recovery.
+    """
+    global NUMBA_CACHE_RESETS
+    if not _NUMBA_CACHE_DIR:
+        return False
+    try:
+        shutil.rmtree(_NUMBA_CACHE_DIR, ignore_errors=True)
+        os.makedirs(_NUMBA_CACHE_DIR, exist_ok=True)
+        NUMBA_CACHE_RESETS += 1
+        print("[tabify] cleared the numba cache after a stale-entry error")
+        return True
+    except OSError:
+        return False
+
+
+def run_prediction(audio_path, min_freq, max_freq):
+    """predict(), retrying once against a poisoned numba cache."""
+    def attempt():
+        with INFERENCE_LOCK:
+            return predict(
+                audio_path,
+                MODEL,
+                minimum_frequency=min_freq,
+                maximum_frequency=max_freq,
+                melodia_trick=True,
+            )
+
+    try:
+        return attempt()
+    except Exception as exc:  # noqa: BLE001
+        if not is_numba_cache_error(exc):
+            raise
+        print(f"[tabify] numba cache error, retrying once: {exc}")
+        if not reset_numba_cache():
+            raise
+        return attempt()
+
+
+def write_test_tone(path, seconds=0.6, freq=440.0, sample_rate=TARGET_SAMPLE_RATE):
+    """A plain PCM WAV, written without needing ffmpeg or numpy."""
+    frames = b"".join(
+        struct.pack("<h", int(math.sin(2 * math.pi * freq * i / sample_rate) * 18000))
+        for i in range(int(sample_rate * seconds))
+    )
+    header = (b"RIFF" + struct.pack("<I", 36 + len(frames)) + b"WAVEfmt "
+              + struct.pack("<IHHIIHH", 16, 1, 1, sample_rate, sample_rate * 2, 2, 16)
+              + b"data" + struct.pack("<I", len(frames)))
+    with open(path, "wb") as handle:
+        handle.write(header + frames)
+
+
+def warm_up_model():
+    """Pay the numba compilation cost at boot instead of on someone's upload."""
+    global MODEL_WARM, WARMUP_NOTE
+    if MODEL is None:
+        WARMUP_NOTE = "no model loaded"
+        return
+    started = time.time()
+    try:
+        with _tempfile.TemporaryDirectory() as tmp:
+            tone = os.path.join(tmp, "warmup.wav")
+            write_test_tone(tone)
+            # Compiles librosa's numba gufuncs here, at boot, where a failure is
+            # visible in the logs instead of on a user's first upload.
+            run_prediction(tone, None, None)
+        MODEL_WARM = True
+        WARMUP_NOTE = f"warmed in {time.time() - started:.1f}s"
+        print(f"[tabify] model warm-up complete ({WARMUP_NOTE})")
+    except Exception as exc:  # noqa: BLE001 - warm-up must never stop the server
+        WARMUP_NOTE = f"{type(exc).__name__}: {exc}"
+        print(f"[tabify] model warm-up FAILED: {WARMUP_NOTE}")
+        print("[tabify] transcription will still be attempted per request")
+
+
+# In a daemon thread so health checks answer immediately while this runs.
+threading.Thread(target=warm_up_model, name="tabify-warmup", daemon=True).start()
+
 
 def midi_note_to_name(midi_num):
     names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
@@ -300,6 +424,7 @@ def health():
         "active_jobs": len(JOBS),
         "model_ready": MODEL is not None,
         "model_backend": MODEL_BACKEND,
+        "model_warm": MODEL_WARM,
         "model_notes": None if MODEL is not None else MODEL_NOTES,
     })
 
@@ -322,6 +447,10 @@ def diagnostics():
         "model_ready": MODEL is not None,
         "ffmpeg": {"path": FFMPEG, "source": FFMPEG_SOURCE, "available": FFMPEG is not None},
         "soundfile": getattr(sf, "__version__", "unknown"),
+        "numba_cache_dir": os.environ.get("NUMBA_CACHE_DIR"),
+        "model_warm": MODEL_WARM,
+        "warmup": WARMUP_NOTE,
+        "numba_cache_resets": NUMBA_CACHE_RESETS,
         "libsndfile": getattr(sf, "__libsndfile_version__", "unknown"),
         "cors_origins": [o if isinstance(o, str) else o.pattern for o in CORS_ORIGINS],
         "frontend_url_set": bool(CONFIGURED_ORIGINS),
@@ -423,18 +552,15 @@ def transcribe():
     min_freq, max_freq = INSTRUMENT_FREQUENCY_BOUNDS.get(instrument, (None, None))
 
     try:
-        _, midi_data, note_events = predict(
-            canonical_path,
-            MODEL,
-            minimum_frequency=min_freq,
-            maximum_frequency=max_freq,
-            melodia_trick=True,
-        )
+        _, midi_data, note_events = run_prediction(canonical_path, min_freq, max_freq)
     except Exception as exc:  # noqa: BLE001
         job_dir.cleanup()
         # NoBackendError and friends stringify to "", which used to produce the
         # useless message "Transcription failed: ".
         reason = str(exc).strip() or type(exc).__name__
+        if is_numba_cache_error(exc):
+            reason = ("the audio library failed to compile on the server "
+                      "(numba cache). Restarting the service usually clears it.")
         return jsonify({"detail": f"Transcription failed: {reason}"}), 500
 
     notes = [

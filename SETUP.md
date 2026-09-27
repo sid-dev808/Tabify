@@ -159,6 +159,42 @@ Settings → **Authorized domains**, or sign-in will be rejected in production.
 > command pins `--workers 1`. Raising the worker count would send a download to a
 > process that never saw the job.
 
+### The numba JIT cache (the 31-second 500s)
+
+librosa JIT-compiles helpers like `_localmax` with **numba**, and caches the
+compiled artifacts *inside its own site-packages directory*. On Render that path
+is read-only at runtime, so nothing is ever cached: every worker recompiles from
+scratch, and on a 0.1-CPU instance that eventually fails from deep inside
+basic-pitch with
+
+> `Transcription failed: no compiled object yet for <Library '_localmax' ...>`
+
+after roughly 31 seconds — which the browser reported as a 500, or, on larger
+uploads, as a dropped connection with no CORS header.
+
+Three changes fix it, all in `backend/app.py`:
+
+1. **`NUMBA_CACHE_DIR` is pointed at writable scratch space** before anything
+   imports librosa. Measured: a fresh compile with an unwritable cache takes
+   14.3 s; with a writable one it loads in 0.7 s.
+2. **The model is warmed up at boot** in a background thread, so the compile is
+   paid once at startup rather than during someone's upload. Health checks still
+   answer immediately while it runs; `/api/health` and `/api/diagnostics` report
+   `model_warm`.
+3. **Inference is serialized** behind a lock. Two concurrent requests both
+   JIT-compiling the same numba function is another way to trigger that error,
+   and on a 512 MB instance running one at a time is the right call anyway.
+
+`backend/gunicorn.conf.py` also raises the worker timeout from gunicorn's
+30-second default to 300. Gunicorn reads that file automatically from the working
+directory, so it applies even if the Render service's start command is a bare
+`gunicorn app:app` — which is what you get when the service was created by hand
+instead of from `render.yaml`.
+
+After a deploy, `/api/diagnostics` should show `model_warm: true` and
+`decode_self_test.ok: true`. Transcription of a short clip then takes well under
+a second.
+
 ### Decoding audio (ffmpeg)
 
 The recorder in the browser produces **WebM/Opus** — that is what `MediaRecorder`
