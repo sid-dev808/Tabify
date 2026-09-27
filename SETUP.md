@@ -159,6 +159,25 @@ Settings → **Authorized domains**, or sign-in will be rejected in production.
 > command pins `--workers 1`. Raising the worker count would send a download to a
 > process that never saw the job.
 
+### One CPU thread for ONNX (the server that stopped answering)
+
+Render's free instance is a slice of a big shared machine: the process can see
+many cores but may only use about a tenth of one. ONNX Runtime, left on its
+defaults, starts one worker thread per visible core, and those threads
+busy-wait between operations. That burns the whole CPU allowance, the kernel
+throttles the entire process, and even `/api/health` stops answering. The logs
+showed warm-up starting and never finishing, with requests stopping after that.
+
+`app.py` now creates the ONNX session with one thread and spinning off, and caps
+OpenMP/OpenBLAS/MKL thread pools at 1 before numpy loads. Output is bit-identical
+to the defaults (checked on 12 inputs). Override with `TABIFY_ORT_THREADS` if you
+move to a bigger instance.
+
+`/api/diagnostics` now reports `cpu.visible_cores`, `cpu.quota` and
+`cpu.onnx_threads`, and the startup log prints them. If warm-up ever takes more
+than 90 s, the backend prints every thread's stack to the Render logs, so the
+stuck call is visible instead of guessed at.
+
 ### Why librosa's numba code is bypassed entirely
 
 basic-pitch only needs five tiny helpers from librosa (`load`, `frames_to_time`,

@@ -1,6 +1,20 @@
 import os
 import tempfile as _tempfile
 
+# ─── CPU: ONE THREAD, NO SPINNING (must run before numpy/onnxruntime load) ───
+# Render's free instance is a slice of a large shared machine: the process sees
+# every core on the host, but may only use ~0.1 of one. Native libraries size
+# their thread pools from the visible core count, and ONNX Runtime's workers
+# busy-wait ("spin") between operations. So a single transcription launched a
+# crowd of spinning threads that burned the entire CPU quota; the kernel then
+# throttled the whole process — including the threads answering /api/health —
+# and the server stopped responding mid warm-up. Measured locally: 16 spinning
+# threads cost 7.5x the CPU of one quiet thread for identical output.
+for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+             "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(_var, "1")
+ORT_THREADS = max(1, int(os.environ.get("TABIFY_ORT_THREADS", "1") or 1))
+
 # ─── NUMBA CACHE (must run before anything imports librosa) ───
 # librosa JIT-compiles helpers like _localmax with numba and caches the result
 # inside its own site-packages directory. On Render that path is read-only at
@@ -336,6 +350,25 @@ BACKEND_PREFERENCE = [
 ]
 
 
+def build_onnx_session(path):
+    """An ONNX Runtime session that cannot starve a CPU-capped container.
+
+    basic-pitch creates its session with defaults: one intra-op thread per
+    visible core, all spin-waiting. Here: a fixed small pool, sequential
+    execution, and spinning off, so idle threads sleep instead of burning quota.
+    """
+    import onnxruntime as ort
+
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = ORT_THREADS
+    options.inter_op_num_threads = 1
+    options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    options.add_session_config_entry("session.inter_op.allow_spinning", "0")
+    return ort.InferenceSession(str(path), sess_options=options, providers=["CPUExecutionProvider"])
+
+
 def load_transcription_model():
     """Return (model, backend_name, failure_notes). Never raises."""
     forced = os.environ.get("BASIC_PITCH_BACKEND", "").strip().lower()
@@ -353,6 +386,8 @@ def load_transcription_model():
             continue
         try:
             model = Model(path)
+            if name == "onnx":
+                model.model = build_onnx_session(path)
         except Exception as exc:  # noqa: BLE001 - try the next backend instead
             notes.append(f"{name}: {type(exc).__name__}: {exc}")
             continue
@@ -377,6 +412,7 @@ INFERENCE_LOCK = threading.Lock()
 
 MODEL_WARM = False
 WARMUP_NOTE = None
+WARMUP_STALL_SECONDS = 90
 NUMBA_CACHE_RESETS = 0
 
 
@@ -447,6 +483,22 @@ def write_test_tone(path, seconds=0.6, freq=440.0, sample_rate=TARGET_SAMPLE_RAT
         handle.write(header + frames)
 
 
+def cpu_quota():
+    """The container's real CPU allowance, from cgroup v2 or v1. None if unlimited."""
+    try:
+        with open("/sys/fs/cgroup/cpu.max") as handle:
+            quota, period = handle.read().split()[:2]
+            return None if quota == "max" else round(int(quota) / int(period), 3)
+    except (OSError, ValueError):
+        pass
+    try:
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us") as q, open("/sys/fs/cgroup/cpu/cpu.cfs_period_us") as per:
+            quota, period = int(q.read()), int(per.read())
+            return None if quota <= 0 else round(quota / period, 3)
+    except (OSError, ValueError):
+        return None
+
+
 def warm_up_model():
     """Pay the numba compilation cost at boot instead of on someone's upload."""
     global MODEL_WARM, WARMUP_NOTE
@@ -454,6 +506,15 @@ def warm_up_model():
         WARMUP_NOTE = "no model loaded"
         return
     started = time.time()
+    print(f"[tabify] warm-up starting (onnx threads={ORT_THREADS}, "
+          f"visible cores={os.cpu_count()}, cpu quota={cpu_quota()})", flush=True)
+    # If warm-up stalls, print every thread's stack to the logs after 90 s.
+    # faulthandler's watchdog is a C thread that does not need the GIL, so this
+    # fires even if the interpreter itself is wedged — the logs then show
+    # exactly which call is stuck instead of leaving us to guess.
+    import faulthandler
+    import sys as _sys
+    faulthandler.dump_traceback_later(WARMUP_STALL_SECONDS, repeat=False, file=_sys.stderr, exit=False)
     try:
         with _tempfile.TemporaryDirectory() as tmp:
             tone = os.path.join(tmp, "warmup.wav")
@@ -461,10 +522,12 @@ def warm_up_model():
             # Compiles librosa's numba gufuncs here, at boot, where a failure is
             # visible in the logs instead of on a user's first upload.
             run_prediction(tone, None, None)
+        faulthandler.cancel_dump_traceback_later()
         MODEL_WARM = True
         WARMUP_NOTE = f"warmed in {time.time() - started:.1f}s"
         print(f"[tabify] model warm-up complete ({WARMUP_NOTE})")
     except Exception as exc:  # noqa: BLE001 - warm-up must never stop the server
+        faulthandler.cancel_dump_traceback_later()
         WARMUP_NOTE = f"{type(exc).__name__}: {exc}"
         print(f"[tabify] model warm-up FAILED: {WARMUP_NOTE}")
         print("[tabify] transcription will still be attempted per request")
@@ -513,6 +576,12 @@ def diagnostics():
         "ffmpeg": {"path": FFMPEG, "source": FFMPEG_SOURCE, "available": FFMPEG is not None},
         "soundfile": getattr(sf, "__version__", "unknown"),
         "librosa_shimmed": LIBROSA_SHIMMED,
+        "cpu": {
+            "visible_cores": os.cpu_count(),
+            "usable_cores": len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None,
+            "quota": cpu_quota(),
+            "onnx_threads": ORT_THREADS,
+        },
         "numba_cache_dir": os.environ.get("NUMBA_CACHE_DIR"),
         "model_warm": MODEL_WARM,
         "warmup": WARMUP_NOTE,
