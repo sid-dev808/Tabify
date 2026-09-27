@@ -159,6 +159,26 @@ Settings → **Authorized domains**, or sign-in will be rejected in production.
 > command pins `--workers 1`. Raising the worker count would send a download to a
 > process that never saw the job.
 
+### Why librosa's numba code is bypassed entirely
+
+basic-pitch only needs five tiny helpers from librosa (`load`, `frames_to_time`,
+`midi_to_hz`, `hz_to_midi`, `cqt_frequencies`). But touching `librosa.load`
+imports modules whose `@guvectorize` decorators JIT-compile **ten** numba kernels
+basic-pitch never calls. Measured cold: 14.5 CPU-seconds and 377 MB peak. On
+Render's fraction-of-a-CPU, 512 MB instance that ran for minutes at the edge of
+memory, so the warm-up never finished and requests died mid-flight — the browser
+then reports a missing CORS header because no response was ever sent.
+
+`app.py` now hands basic-pitch those five functions written directly in numpy
+(`_LibrosaShim`). librosa's numba modules are never imported and nothing is
+compiled: cold start is 1.0 CPU-second and 210 MB. Output was verified
+**bit-identical** to real librosa across melodies, chords, noise, a 30 s clip and
+a real WebM recording. `/api/diagnostics` reports `librosa_shimmed: true`. Set
+`TABIFY_USE_LIBROSA=1` to go back to real librosa.
+
+The numba-cache handling below is kept as a safety net, but with the shim in
+place it should never trigger.
+
 ### The numba JIT cache (the 31-second 500s)
 
 librosa JIT-compiles helpers like `_localmax` with **numba**, and caches the

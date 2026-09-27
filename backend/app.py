@@ -40,6 +40,71 @@ from basic_pitch import (
     build_icassp_2022_model_path,
 )
 from basic_pitch.inference import Model, predict
+import numpy as np
+
+# ─── KEEP NUMBA OUT OF THE REQUEST PATH ───
+# basic-pitch reaches into librosa for five small helpers: load(),
+# frames_to_time(), midi_to_hz(), hz_to_midi() and cqt_frequencies(). But the
+# first touch of librosa.load imports librosa.core.audio and librosa.util.utils,
+# whose @guvectorize decorators JIT-compile ten numba kernels (_localmax,
+# _localmin, __peak_pick, _zc_wrapper, ...) that basic-pitch never calls.
+#
+# That compile costs ~16 s and ~190 MB on a fast machine. On Render's
+# fraction-of-a-CPU, 512 MB instance it runs for minutes at the edge of memory:
+# warm-up never finishes, requests die mid-flight with no response (so the
+# browser reports a missing CORS header), and when it does complete it can fail
+# with "no compiled object yet for <Library ...>".
+#
+# So basic-pitch gets these five functions directly, written in numpy with the
+# exact formulas librosa uses (verified bit-for-bit against librosa's output).
+# librosa's numba modules are then never imported, and nothing is compiled.
+# Set TABIFY_USE_LIBROSA=1 to fall back to real librosa.
+class _LibrosaShim:
+    """The slice of librosa basic-pitch's predict() path actually uses."""
+
+    @staticmethod
+    def load(path, sr=22050, mono=True, **_ignored):
+        audio, native_sr = sf.read(str(path), dtype="float32", always_2d=True)
+        audio = audio.mean(axis=1) if mono else audio.T
+        if sr is not None and native_sr != sr:
+            # Uploads are transcoded to 22.05 kHz first, so this only runs for
+            # direct callers; polyphase resampling needs no JIT.
+            from math import gcd
+            from scipy.signal import resample_poly
+            g = gcd(int(native_sr), int(sr))
+            audio = resample_poly(audio, int(sr) // g, int(native_sr) // g, axis=-1).astype(np.float32)
+            native_sr = sr
+        return np.ascontiguousarray(audio, dtype=np.float32), native_sr
+
+    @staticmethod
+    def midi_to_hz(notes):
+        return 440.0 * (2.0 ** ((np.asanyarray(notes) - 69.0) / 12.0))
+
+    @staticmethod
+    def hz_to_midi(frequencies):
+        return 12 * (np.log2(np.asanyarray(frequencies)) - np.log2(440.0)) + 69
+
+    class core:  # noqa: N801 - mirrors the librosa.core namespace
+        @staticmethod
+        def frames_to_time(frames, *, sr=22050, hop_length=512, n_fft=None):
+            offset = int(n_fft // 2) if n_fft else 0
+            samples = (np.asanyarray(frames) * hop_length + offset).astype(int)
+            return np.asanyarray(samples) / float(sr)
+
+        @staticmethod
+        def cqt_frequencies(n_bins, *, fmin, bins_per_octave=12, tuning=0.0):
+            correction = 2.0 ** (float(tuning) / bins_per_octave)
+            return correction * fmin * 2.0 ** (np.arange(0, n_bins, dtype=float) / bins_per_octave)
+
+
+LIBROSA_SHIMMED = os.environ.get("TABIFY_USE_LIBROSA", "").strip() not in ("1", "true", "yes")
+if LIBROSA_SHIMMED:
+    import basic_pitch.inference as _bp_inference
+    import basic_pitch.note_creation as _bp_note_creation
+
+    _bp_inference.librosa = _LibrosaShim
+    _bp_note_creation.librosa = _LibrosaShim
+    print("[tabify] basic-pitch is using the numpy librosa shim (no numba JIT)")
 from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 
@@ -447,6 +512,7 @@ def diagnostics():
         "model_ready": MODEL is not None,
         "ffmpeg": {"path": FFMPEG, "source": FFMPEG_SOURCE, "available": FFMPEG is not None},
         "soundfile": getattr(sf, "__version__", "unknown"),
+        "librosa_shimmed": LIBROSA_SHIMMED,
         "numba_cache_dir": os.environ.get("NUMBA_CACHE_DIR"),
         "model_warm": MODEL_WARM,
         "warmup": WARMUP_NOTE,
