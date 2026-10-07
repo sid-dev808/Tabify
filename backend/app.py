@@ -470,6 +470,125 @@ def run_prediction(audio_path, min_freq, max_freq):
         return attempt()
 
 
+# ─── NOTE ANALYSIS (transcription.py) ───
+# basic-pitch's raw posteriorgrams are read with stricter thresholds plus a
+# second, lenient pass and the SwiftF0 pitch tracker, then every note gets a
+# calibrated confidence and playing-technique flags. See TRANSCRIPTION.md.
+# If anything in this path fails, the request falls back to the plain
+# basic-pitch result, so the new code can never make a transcription fail.
+# TABIFY_LEGACY_TRANSCRIPTION=1 switches it off entirely.
+import sys as _sys
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # transcription.py sits beside app.py
+try:
+    import transcription as note_analysis
+    from basic_pitch.inference import run_inference as _bp_run_inference
+    ANALYSIS_NOTE = None
+except Exception as _exc:  # noqa: BLE001
+    note_analysis = None
+    ANALYSIS_NOTE = f"{type(_exc).__name__}: {_exc}"
+    print(f"[tabify] note analysis unavailable ({ANALYSIS_NOTE}); using plain basic-pitch")
+USE_ANALYSIS = os.environ.get("TABIFY_LEGACY_TRANSCRIPTION", "") not in ("1", "true", "yes")
+
+_PITCH_TRACKER = None
+_PITCH_TRACKER_LOCK = threading.Lock()
+
+
+def pitch_tracker():
+    """The SwiftF0 detector: one thread, no spinning, built once."""
+    global _PITCH_TRACKER, ANALYSIS_NOTE
+    if _PITCH_TRACKER is None:
+        with _PITCH_TRACKER_LOCK:
+            if _PITCH_TRACKER is None:
+                try:
+                    from swift_f0 import SwiftF0
+                    tracker = SwiftF0(threads=1, spin=False)
+                    tracker.session = quiet_swift_session(tracker.session)
+                    _PITCH_TRACKER = tracker
+                except Exception as exc:  # noqa: BLE001
+                    ANALYSIS_NOTE = f"SwiftF0 unavailable: {type(exc).__name__}: {exc}"
+                    print(f"[tabify] {ANALYSIS_NOTE}; notes are found without it")
+                    _PITCH_TRACKER = False
+    return _PITCH_TRACKER or None
+
+
+def quiet_swift_session(default_session):
+    """SwiftF0's own session, rebuilt without ONNX Runtime's memory arena.
+
+    SwiftF0 runs 30-second windows; with the arena on, ONNX Runtime keeps the
+    largest window's buffers for good (+170 MB on a 5-minute clip), which is
+    too much on a 512 MB instance. Without it the extra memory is ~30 MB and
+    is handed back after each call. Results are identical."""
+    try:
+        import onnxruntime as ort
+        import swift_f0
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = 1
+        options.inter_op_num_threads = 1
+        options.enable_cpu_mem_arena = False
+        options.enable_mem_pattern = False
+        options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+        model = os.path.join(os.path.dirname(swift_f0.__file__), "model.onnx")
+        return ort.InferenceSession(model, options, providers=["CPUExecutionProvider"])
+    except Exception as exc:  # noqa: BLE001 - the default session still works
+        print(f"[tabify] keeping SwiftF0's default session ({type(exc).__name__}: {exc})")
+        return default_session
+
+
+SWIFT_RANGE = (46.875, 2093.75)
+
+GM_PROGRAMS = {"guitar": 25, "bass": 33, "ukulele": 24, "violin": 40, "piano": 0,
+               "sax": 65, "voice": 52}
+
+
+def run_analysis(audio_path, instrument, min_freq, max_freq):
+    """Notes with confidence and techniques, as transcription.Note objects."""
+    audio, sample_rate = sf.read(audio_path, dtype="float32")
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+
+    # SwiftF0 first: its working memory is freed before basic-pitch's large
+    # activation matrices exist, so the two peaks never stack.
+    swift = None
+    tracker = pitch_tracker()
+    if tracker is not None:
+        lo = max(SWIFT_RANGE[0], (min_freq or SWIFT_RANGE[0]) * 0.85)
+        hi = min(SWIFT_RANGE[1], (max_freq or SWIFT_RANGE[1]) * 1.05)
+        try:
+            with INFERENCE_LOCK:
+                swift = tracker.detect(audio, sample_rate, fmin=lo, fmax=hi)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[tabify] SwiftF0 failed on this clip ({exc}); continuing without it")
+
+    def infer():
+        with INFERENCE_LOCK:
+            return _bp_run_inference(audio_path, MODEL)
+
+    try:
+        model_output = infer()
+    except Exception as exc:  # noqa: BLE001
+        if not is_numba_cache_error(exc) or not reset_numba_cache():
+            raise
+        model_output = infer()
+    model_output.pop("contour", None)   # pitch-bend detail we don't use; ~25 MB on a long clip
+
+    notes = note_analysis.analyse(model_output, swift, audio, sample_rate, instrument, min_freq, max_freq)
+    del model_output, swift, audio
+    return notes
+
+
+def notes_to_midi(notes, instrument):
+    import pretty_midi
+    midi = pretty_midi.PrettyMIDI(initial_tempo=120)
+    track = pretty_midi.Instrument(program=GM_PROGRAMS.get(instrument, 0),
+                                   is_drum=instrument == "drums", name=f"Tabify {instrument}")
+    for n in notes:
+        track.notes.append(pretty_midi.Note(
+            velocity=int(min(127, max(1, round(n.amplitude * 127)))),
+            pitch=int(n.pitch), start=float(n.start), end=float(max(n.end, n.start + 0.02))))
+    midi.instruments.append(track)
+    return midi
+
+
 def write_test_tone(path, seconds=0.6, freq=440.0, sample_rate=TARGET_SAMPLE_RATE):
     """A plain PCM WAV, written without needing ffmpeg or numpy."""
     frames = b"".join(
@@ -522,6 +641,11 @@ def warm_up_model():
             # Compiles librosa's numba gufuncs here, at boot, where a failure is
             # visible in the logs instead of on a user's first upload.
             run_prediction(tone, None, None)
+            if note_analysis is not None and USE_ANALYSIS:
+                try:
+                    run_analysis(tone, "guitar", 82.41, 1318.51)
+                except Exception as exc:  # noqa: BLE001 - the plain path still works
+                    print(f"[tabify] note-analysis warm-up failed: {type(exc).__name__}: {exc}")
         faulthandler.cancel_dump_traceback_later()
         MODEL_WARM = True
         WARMUP_NOTE = f"warmed in {time.time() - started:.1f}s"
@@ -554,6 +678,9 @@ def health():
         "model_backend": MODEL_BACKEND,
         "model_warm": MODEL_WARM,
         "model_notes": None if MODEL is not None else MODEL_NOTES,
+        "note_analysis": bool(note_analysis is not None and USE_ANALYSIS),
+        "pitch_tracker": _PITCH_TRACKER is not None and _PITCH_TRACKER is not False,
+        "analysis_notes": ANALYSIS_NOTE,
     })
 
 
@@ -686,29 +813,58 @@ def transcribe():
 
     min_freq, max_freq = INSTRUMENT_FREQUENCY_BOUNDS.get(instrument, (None, None))
 
-    try:
-        _, midi_data, note_events = run_prediction(canonical_path, min_freq, max_freq)
-    except Exception as exc:  # noqa: BLE001
-        job_dir.cleanup()
-        # NoBackendError and friends stringify to "", which used to produce the
-        # useless message "Transcription failed: ".
-        reason = str(exc).strip() or type(exc).__name__
-        if is_numba_cache_error(exc):
-            reason = ("the audio library failed to compile on the server "
-                      "(numba cache). Restarting the service usually clears it.")
-        return jsonify({"detail": f"Transcription failed: {reason}"}), 500
+    notes = None
+    engine = "basic-pitch"
+    if note_analysis is not None and USE_ANALYSIS:
+        try:
+            analysed = run_analysis(canonical_path, instrument, min_freq, max_freq)
+            midi_data = notes_to_midi(analysed, instrument)
+            notes = [
+                {
+                    "start": round(float(n.start), 4),
+                    "end": round(float(n.end), 4),
+                    "pitch_midi": int(n.pitch),
+                    "pitch": midi_note_to_name(n.pitch),
+                    "amplitude": round(float(n.amplitude), 3),
+                    "confidence": round(float(n.confidence), 3),
+                    "techniques": list(n.techniques),
+                    **({"harmonic_fret": n.harmonic_fret, "harmonic_string": n.harmonic_string}
+                       if n.harmonic_fret is not None else {}),
+                    **({"tremolo_rate": n.tremolo_rate} if n.tremolo_rate else {}),
+                    **({"vibrato_rate": n.vibrato_rate, "vibrato_cents": n.vibrato_cents}
+                       if n.vibrato_rate else {}),
+                }
+                for n in analysed
+            ]
+            engine = "tabify-analysis"
+        except Exception as exc:  # noqa: BLE001 - fall back to the plain model below
+            print(f"[tabify] note analysis failed, using plain basic-pitch: {type(exc).__name__}: {exc}")
+            notes = None
 
-    notes = [
-        {
-            "start": float(start),
-            "end": float(end),
-            "pitch_midi": int(round(pitch)),
-            "pitch": midi_note_to_name(pitch),
-            "amplitude": float(amplitude),
-        }
-        for start, end, pitch, amplitude, _pitch_bend in note_events
-    ]
-    notes.sort(key=lambda n: n["start"])
+    if notes is None:
+        try:
+            _, midi_data, note_events = run_prediction(canonical_path, min_freq, max_freq)
+        except Exception as exc:  # noqa: BLE001
+            job_dir.cleanup()
+            # NoBackendError and friends stringify to "", which used to produce the
+            # useless message "Transcription failed: ".
+            reason = str(exc).strip() or type(exc).__name__
+            if is_numba_cache_error(exc):
+                reason = ("the audio library failed to compile on the server "
+                          "(numba cache). Restarting the service usually clears it.")
+            return jsonify({"detail": f"Transcription failed: {reason}"}), 500
+
+        notes = [
+            {
+                "start": float(start),
+                "end": float(end),
+                "pitch_midi": int(round(pitch)),
+                "pitch": midi_note_to_name(pitch),
+                "amplitude": float(amplitude),
+            }
+            for start, end, pitch, amplitude, _pitch_bend in note_events
+        ]
+    notes.sort(key=lambda n: (n["start"], n["pitch_midi"]))
     duration = max((n["end"] for n in notes), default=0.0)
 
     job_id = uuid.uuid4().hex
@@ -725,7 +881,7 @@ def transcribe():
             "created": time.time(),
         }
 
-    return jsonify({"job_id": job_id, "notes": notes, "duration": duration})
+    return jsonify({"job_id": job_id, "notes": notes, "duration": duration, "engine": engine})
 
 
 @app.route("/api/download/<job_id>/midi", methods=["GET"])

@@ -1,3 +1,65 @@
+# Changes — Oct 2026: accurate notes, confidence, techniques, dynamics
+
+### A. Fewer wrong notes
+
+On a labelled guitar test set, the share of notes on the page that are
+actually right went from **57–59% to 89–93%**. F1 went from **70% to 86–93%**
+(browser-quality and clean audio). basic-pitch now runs with stricter
+thresholds. A second, lenient pass recovers quiet chord tones, and the
+**SwiftF0** pitch tracker (MIT, a 120 KB ONNX model) fills in notes basic-pitch
+missed. Method and numbers: `backend/TRANSCRIPTION.md`.
+
+### B. Every note has a confidence
+
+Notes the server is unsure of (below 0.85, which are right only about half
+the time) are drawn faded in Review and Edit. The editor has **Check next**
+and **Remove all unsure** buttons, and an **It's right** button per note.
+Exports never show the fading.
+
+### C. Techniques in the editor: harmonics, hammer-ons, pull-offs, vibrato, tremolo
+
+Select a note and toggle any of these, either with the buttons or the keys
+**N H P V T**. Hammer-ons and pull-offs are mutually exclusive. They are drawn
+as follows:
+
+| Technique | Sheet music | TAB |
+|---|---|---|
+| Harmonic | Diamond notehead | `<12>` at the touched fret, on the right string |
+| Hammer-on / pull-off | Slur marked H / P | Arc marked h / p; both notes are kept on one string |
+| Vibrato | Wavy line | Wavy line |
+| Tremolo | Three slashes through the stem | Three slashes |
+
+Playback plays each technique: a pitch LFO for vibrato, re-picked pulses for
+tremolo, no pick attack on hammer-ons and pull-offs, and a pure tone for
+harmonics.
+
+### D. They are also detected automatically
+
+The server marks tremolo picking, hammer-ons, pull-offs, vibrato and natural
+harmonics. Tremolo picking that used to come out as a pile of separate notes
+now becomes one note with tremolo slashes. The detectors are cautious: a mark
+is right 86–100% of the time, but some techniques go unmarked, especially on
+noisy recordings. You can add any missed ones in Edit.
+
+### E. Crescendo and decrescendo
+
+In Edit, select the note where the change starts, press **Crescendo** or
+**Decrescendo** (or the `<` / `>` keys), then tap the note where it ends.
+Hairpins are drawn under the staff in both sheet music and TAB. Tap a hairpin
+to flip or remove it. They also change playback volume and MIDI velocities.
+
+### F. Smaller fixes found along the way
+
+- MIDI downloads are now built from the score as you edited it. Before, a
+  fresh take downloaded the server's unedited MIDI.
+- TAB never puts two notes of a chord on the same string.
+- Low notes on the last line of sheet music are no longer cut off at the
+  bottom.
+- Saved projects store techniques, confidence and hairpins. Older saves still
+  open.
+
+---
+
 # Changes — Sept 2026
 
 Ten changes, chosen by walking the app as a first-time user and asking where it

@@ -19,12 +19,25 @@ import { db } from "./firebase";
    uid field) means: the security rules are a one-liner, listing a user's work
    needs no composite index, and deleting an account is a single subtree walk. */
 
-/** The transcribed notes exactly as the backend returned them, stored compactly
-    (s=start, e=end, m=midi) so a saved project can be re-rendered later. */
+/** The transcribed notes, stored compactly (s=start, e=end, m=midi) so a saved
+    project can be re-rendered later. Optional extras: c=confidence, a=amplitude,
+    t=technique letters (N harmonic, H hammer-on, P pull-off, V vibrato, T tremolo),
+    hf=harmonic fret. Projects saved before these existed still load. */
 export interface StoredNote {
   s: number;
   e: number;
   m: number;
+  c?: number;
+  a?: number;
+  t?: string;
+  hf?: number;
+}
+
+/** A crescendo (<) or decrescendo (>) between two times in seconds. */
+export interface StoredHairpin {
+  k: "<" | ">";
+  s: number;
+  e: number;
 }
 
 export interface TranscriptionInput {
@@ -38,6 +51,7 @@ export interface TranscriptionInput {
   notes: StoredNote[];
   /** Detected tempo, so a reopened project shows the same bar lines. */
   bpm: number;
+  hairpins?: StoredHairpin[];
 }
 
 export interface TranscriptionRecord extends TranscriptionInput {
@@ -54,15 +68,20 @@ function transcriptionsRef(uid: string) {
 }
 
 export async function saveTranscription(uid: string, input: TranscriptionInput) {
-  const notes = input.notes.slice(0, MAX_STORED_NOTES).map(n => ({
-    s: Number(n.s.toFixed(3)),
-    e: Number(n.e.toFixed(3)),
-    m: Math.round(n.m),
-  }));
+  // Firestore rejects undefined values, so optional keys are only written when set.
+  const notes = input.notes.slice(0, MAX_STORED_NOTES).map(n => {
+    const out: StoredNote = { s: Number(n.s.toFixed(3)), e: Number(n.e.toFixed(3)), m: Math.round(n.m) };
+    if (typeof n.c === "number") out.c = Number(n.c.toFixed(2));
+    if (typeof n.a === "number") out.a = Number(n.a.toFixed(2));
+    if (n.t) out.t = n.t;
+    if (n.hf) out.hf = n.hf;
+    return out;
+  });
 
   return addDoc(transcriptionsRef(uid), {
     ...input,
     notes,
+    hairpins: (input.hairpins ?? []).map(h => ({ k: h.k, s: Number(h.s.toFixed(3)), e: Number(h.e.toFixed(3)) })),
     noteCount: input.notes.length,
     createdAtMs: Date.now(),
     createdAt: serverTimestamp(),
@@ -83,6 +102,7 @@ function toRecord(id: string, data: Record<string, unknown>): TranscriptionRecor
     noteCount: (data.noteCount as number) ?? ((data.notes as StoredNote[]) ?? []).length,
     createdAtMs: (data.createdAtMs as number) ?? 0,
     bpm: (data.bpm as number) ?? 120,
+    hairpins: (data.hairpins as StoredHairpin[]) ?? [],
   };
 }
 

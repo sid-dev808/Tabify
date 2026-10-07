@@ -155,6 +155,14 @@ changing one needs a redeploy.
 Also add your Render frontend domain under Firebase console → Authentication →
 Settings → **Authorized domains**, or sign-in will be rejected in production.
 
+**Note analysis (optional switch).** The backend refines basic-pitch's notes
+and detects techniques (see `backend/TRANSCRIPTION.md`). It needs the
+`swift-f0` package in `requirements.txt`. To go back to plain basic-pitch
+output without a redeploy of code, set `TABIFY_LEGACY_TRANSCRIPTION=1` on the
+backend service. `GET /api/health` shows `note_analysis: true` while it is on.
+If the analysis ever fails on a clip, that request quietly falls back to plain
+basic-pitch output.
+
 > The backend keeps transcription jobs in process memory, which is why the start
 > command pins `--workers 1`. Raising the worker count would send a download to a
 > process that never saw the job.

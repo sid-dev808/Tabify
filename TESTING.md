@@ -56,6 +56,18 @@ notes, missing notes, wrong octave.
 
 Record the number. It's the single most important metric you have.
 
+### 3b. Techniques, unsure notes and dynamics (3 min) — guitarists only
+Ask them to play a few hammer-ons and pull-offs, a note with vibrato, a
+12th-fret harmonic, and some fast tremolo picking on one note.
+
+Watch for:
+- Did the marks show up (H/P slurs, wavy line, diamond, slashes)? Note which
+  ones were missed and which appeared where they didn't play them.
+- Do they understand the faded "unsure" notes without being told? Do they use
+  **Check next**?
+- Can they add a crescendo without help? (Select a note, press Crescendo, tap
+  the end note.)
+
 ### 4. Getting it out (3 min)
 Ask them to save it and get a copy they could send to a friend.
 

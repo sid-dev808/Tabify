@@ -4,13 +4,28 @@
    conversion, and nothing else — it is pure functions over numbers so it can be
    tested without a browser. */
 
+/** Playing techniques the backend can detect and the editor can mark. */
+export type Technique = "harmonic" | "hammer_on" | "pull_off" | "vibrato" | "tremolo";
+export const TECHNIQUES: Technique[] = ["harmonic", "hammer_on", "pull_off", "vibrato", "tremolo"];
+
 export interface ApiNote {
   start: number;
   end: number;
   pitch_midi: number;
   pitch: string;
   amplitude: number;
+  /** 0-1, calibrated: at 0.85+ about 19 notes in 20 are right. Absent from older servers. */
+  confidence?: number;
+  techniques?: string[];
+  /** Natural harmonics: the fret touched (12, 7, 5 or 4). */
+  harmonic_fret?: number;
+  tremolo_rate?: number;
+  vibrato_rate?: number;
+  vibrato_cents?: number;
 }
+
+/** Below this a note is shown as "unsure" for the user to check. */
+export const UNSURE_BELOW = 0.85;
 
 /** Note values we are willing to write, longest first, measured in quarter beats. */
 export type Glyph = "w" | "h." | "h" | "q." | "q" | "e." | "e" | "s";
@@ -170,6 +185,16 @@ export interface ScoreEvent {
   /** Original seconds, kept for playback and for re-saving. */
   start: number;
   end: number;
+  /** How sure the transcriber was (1 once the user has touched the note). */
+  confidence: number;
+  /** 0-1 loudness the note was played at. */
+  amplitude: number;
+  techniques: Technique[];
+  harmonicFret?: number;
+}
+
+export function cleanTechniques(list: string[] | undefined): Technique[] {
+  return (list ?? []).filter((t): t is Technique => (TECHNIQUES as string[]).includes(t));
 }
 
 function snap(beats: number) {
@@ -204,6 +229,10 @@ export function quantizeNotes(apiNotes: ApiNote[], tempo: Tempo): ScoreEvent[] {
       pitch: n.pitch,
       start: n.start,
       end: n.end,
+      confidence: n.confidence ?? 1,
+      amplitude: n.amplitude ?? 0.7,
+      techniques: cleanTechniques(n.techniques),
+      ...(n.harmonic_fret ? { harmonicFret: n.harmonic_fret } : {}),
     });
   }
 
@@ -248,7 +277,7 @@ export function addRests(events: ScoreEvent[], measureCount: number): ScoreEvent
           rests.push({
             kind: "rest", id: id++, measure: m, beat: cursor * GRID,
             beats: value.beats, glyph: value.glyph, midi: 0, pitch: "",
-            start: 0, end: 0,
+            start: 0, end: 0, confidence: 1, amplitude: 0, techniques: [],
           });
         }
         cursor += Math.round(value.beats / GRID);

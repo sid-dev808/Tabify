@@ -26,10 +26,11 @@ import { notesToMidiBlob } from "./lib/midi";
 import { ScorePlayer, type PlayableNote } from "./lib/playback";
 import { downloadBlob, svgBlob, svgToPdfBlob, svgToPngBlob } from "./lib/exporters";
 import {
-  CARD_PALETTE, EMPTY_SCORE, FORMATS, INSTRUMENTS, STATUS_MSGS,
-  buildScore, buildScoreFromStoredNotes, fmtDate, fmtTime, formatById, instrumentById,
-  rebuildAfterEdit, staffTop, tabTop, toStoredNotes, transposeEvent,
-  type ApiNote, type Format, type LaidOutEvent, type Score,
+  CARD_PALETTE, EMPTY_SCORE, FORMATS, INSTRUMENTS, STATUS_MSGS, TECHNIQUES, TECHNIQUE_INFO,
+  buildScore, buildScoreFromStoredNotes, fmtDate, fmtTime, formatById, instrumentById, isUnsure,
+  midiNotesOf, naturalHarmonicFor, playableNotes, rebuildAfterEdit, STANDARD_TUNING, staffTop, tabTop, timeToPosition, toStoredHairpins,
+  toStoredNotes, toggleTechnique, transposeEvent,
+  type ApiNote, type Format, type Hairpin, type LaidOutEvent, type Score, type Technique,
 } from "./lib/score";
 
 type Step =
@@ -94,12 +95,7 @@ function PlaybackBar({ score, onHighlight, compact = false }: {
   const [playing, setPlaying] = useState(false);
   const playerRef = useRef<ScorePlayer | null>(null);
 
-  const notes: PlayableNote[] = useMemo(
-    () => score.events
-      .filter(e => e.kind === "note")
-      .map(e => ({ id: e.id, midi: e.midi, start: e.start, end: e.end })),
-    [score.events]
-  );
+  const notes: PlayableNote[] = useMemo(() => playableNotes(score), [score]);
 
   useEffect(() => () => { playerRef.current?.dispose(); }, []);
 
@@ -707,18 +703,33 @@ function ReviewScreen({ score, format, onBack, onEdit, onAccept }: {
   const [highlight, setHighlight] = useState<number[]>([]);
   const Renderer = rendererFor(format);
   const onHighlight = useCallback((ids: number[]) => setHighlight(ids), []);
+  const found = useMemo(() => {
+    const notes = score.events.filter(e => e.kind === "note");
+    const parts = TECHNIQUES.map(t => {
+      const n = notes.filter(e => e.techniques.includes(t)).length;
+      return n ? `${n} ${TECHNIQUE_INFO[t].label.toLowerCase()}${n === 1 ? "" : "s"}` : "";
+    }).filter(Boolean);
+    const unsure = notes.filter(isUnsure).length;
+    return { parts, unsure };
+  }, [score.events]);
 
   return (
     <Screen>
       <NavBar onBack={onBack} title="Review" />
       <div className="flex-1 flex flex-col px-6 py-6 max-w-3xl mx-auto w-full min-h-0">
         <Document>
-          <Renderer score={score} highlight={highlight} />
+          <Renderer score={score} highlight={highlight} showConfidence />
         </Document>
         <p className="text-center text-[#5e5a70] text-xs mt-3">
           {score.noteCount} notes · {score.measures} bars · ♩={Math.round(score.tempo.bpm)}
           {score.tempo.confidence < 0.45 && " (tempo is a guess — a steadier take detects better)"}
         </p>
+        {(found.parts.length > 0 || found.unsure > 0) && (
+          <p className="text-center text-[#5e5a70] text-xs mt-1">
+            {found.parts.length > 0 && <>Detected {found.parts.join(", ")}. </>}
+            {found.unsure > 0 && <>{found.unsure} faded {found.unsure === 1 ? "note is" : "notes are"} unsure — check {found.unsure === 1 ? "it" : "them"} in Edit.</>}
+          </p>
+        )}
         <div className="flex flex-wrap items-center justify-center gap-3 mt-4 shrink-0">
           <PlaybackBar score={score} onHighlight={onHighlight} />
           <Btn variant="secondary" onClick={onEdit} icon={<Edit3 size={14} />}>Edit Music</Btn>
@@ -730,21 +741,31 @@ function ReviewScreen({ score, format, onBack, onEdit, onAccept }: {
 }
 
 /* ─── SCREEN: EDIT ─── */
+type PendingHairpin = { kind: Hairpin["kind"]; fromId: number };
+
 function EditScreen({ score, setScore, format, onBack, onContinue, onDelete }: {
   score: Score; setScore: (next: Score) => void; format: Format;
   onBack: () => void; onContinue: () => void; onDelete: () => void;
 }) {
   const [selected, setSelected] = useState<number | null>(null);
+  const [selectedHairpin, setSelectedHairpin] = useState<number | null>(null);
+  const [pending, setPending] = useState<PendingHairpin | null>(null);
   const [highlight, setHighlight] = useState<number[]>([]);
   const sel = selected !== null ? score.events.find(e => e.id === selected && e.kind === "note") ?? null : null;
+  const hairpin = selectedHairpin !== null ? score.hairpins.find(h => h.id === selectedHairpin) ?? null : null;
+  const unsure = useMemo(
+    () => score.events.filter(e => isUnsure(e)).sort((a, b) => a.start - b.start),
+    [score.events]
+  );
   const Renderer = rendererFor(format);
   const onHighlight = useCallback((ids: number[]) => setHighlight(ids), []);
 
   /* Every edit re-derives the whole score, so rests and bar lines stay
      consistent with the notes instead of drifting out of sync. */
-  function apply(mutate: (events: LaidOutEvent[]) => LaidOutEvent[]) {
-    setScore(rebuildAfterEdit(mutate(score.events), score.tempo));
+  function apply(mutate: (events: LaidOutEvent[]) => LaidOutEvent[], hairpins: Hairpin[] = score.hairpins) {
+    setScore(rebuildAfterEdit(mutate(score.events), score.tempo, hairpins));
   }
+  const setHairpins = (hairpins: Hairpin[]) => apply(events => events, hairpins);
 
   const shiftPitch = (semitones: number) => {
     if (selected === null) return;
@@ -757,41 +778,157 @@ function EditScreen({ score, setScore, format, onBack, onContinue, onDelete }: {
     setSelected(null);
   };
 
-  // Arrow keys are how anyone actually edits a score.
+  const toggle = (technique: Technique) => {
+    if (selected === null) return;
+    apply(events => events.map(e => (e.id === selected ? toggleTechnique(e, technique) : e)));
+  };
+
+  const markSure = () => {
+    if (selected === null) return;
+    apply(events => events.map(e => (e.id === selected ? { ...e, confidence: 1 } : e)));
+  };
+
+  const removeUnsure = () => {
+    const drop = new Set(unsure.map(e => e.id));
+    apply(events => events.filter(e => !drop.has(e.id)));
+    if (selected !== null && drop.has(selected)) setSelected(null);
+  };
+
+  const nextUnsure = () => {
+    if (unsure.length === 0) return;
+    const after = sel ? unsure.find(e => e.start > sel.start) : undefined;
+    setSelectedHairpin(null);
+    setSelected((after ?? unsure[0]).id);
+  };
+
+  /* Crescendo / decrescendo: pick the first note, press the button, then tap
+     the note where it should end. */
+  const startHairpin = (kind: Hairpin["kind"]) => {
+    if (selected === null) return;
+    setPending({ kind, fromId: selected });
+  };
+
+  function finishHairpin(toId: number) {
+    if (!pending) return;
+    const a = score.events.find(e => e.id === pending.fromId);
+    const b = score.events.find(e => e.id === toId);
+    setPending(null);
+    if (!a || !b) return;
+    const id = Math.max(0, ...score.hairpins.map(h => h.id)) + 1;
+    const start = Math.min(a.start, b.start);
+    const end = Math.max(a.end, b.end, start + 0.1);
+    setHairpins([...score.hairpins, { id, kind: pending.kind, start, end }]);
+    setSelected(null);
+    setSelectedHairpin(id);
+  }
+
+  const removeHairpin = (id: number) => {
+    setHairpins(score.hairpins.filter(h => h.id !== id));
+    if (selectedHairpin === id) setSelectedHairpin(null);
+  };
+
+  const flipHairpin = (id: number) => setHairpins(score.hairpins.map(h =>
+    h.id === id ? { ...h, kind: h.kind === "cresc" ? "decresc" : "cresc" } : h));
+
+  function onNote(id: number) {
+    if (pending) { finishHairpin(id); return; }
+    setSelectedHairpin(null);
+    setSelected(id === selected ? null : id);
+  }
+
+  function onHairpin(id: number) {
+    setPending(null);
+    setSelected(null);
+    setSelectedHairpin(id === selectedHairpin ? null : id);
+  }
+
+  // Arrow keys are how anyone actually edits a score; letters toggle techniques.
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      if (e.key === "Escape") { setPending(null); setSelected(null); setSelectedHairpin(null); return; }
+      if (selectedHairpin !== null && (e.key === "Backspace" || e.key === "Delete")) {
+        e.preventDefault(); removeHairpin(selectedHairpin); return;
+      }
       if (selected === null) return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
       if (e.key === "ArrowUp")        { e.preventDefault(); shiftPitch(e.shiftKey ? 12 : 1); }
       else if (e.key === "ArrowDown") { e.preventDefault(); shiftPitch(e.shiftKey ? -12 : -1); }
       else if (e.key === "Backspace" || e.key === "Delete") { e.preventDefault(); removeSelected(); }
-      else if (e.key === "Escape")    { setSelected(null); }
+      else if (e.key === "<") { startHairpin("cresc"); }
+      else if (e.key === ">") { startHairpin("decresc"); }
+      else {
+        const technique = TECHNIQUES.find(t => TECHNIQUE_INFO[t].key === e.key.toUpperCase());
+        if (technique) { e.preventDefault(); toggle(technique); }
+      }
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   });
+
+  const describeSpan = (h: Hairpin) => {
+    const a = timeToPosition(h.start, score.tempo).measure + 1;
+    const b = timeToPosition(h.end, score.tempo).measure + 1;
+    return a === b ? `bar ${a}` : `bars ${a}–${b}`;
+  };
+
+  const hint = pending
+    ? `Now tap the note where the ${pending.kind === "cresc" ? "crescendo" : "decrescendo"} ends · esc to cancel`
+    : sel
+      ? "↑ ↓ semitone · shift for octave · N H P V T techniques · < > dynamics · delete removes"
+      : "Tap a note to edit it · tap a hairpin to change it · faded notes are unsure";
 
   return (
     <Screen>
       <NavBar onBack={onBack} title="Edit Music" />
       <div className="flex-1 flex flex-col md:flex-row min-h-0 overflow-hidden">
         <div className="flex-1 overflow-y-auto p-6 min-h-0" style={{ scrollbarWidth: "none" }}>
-          <div className="rounded-2xl bg-white shadow-[0_24px_72px_rgba(0,0,0,0.6)] p-8 max-w-3xl mx-auto">
-            <Renderer score={score} selected={selected} highlight={highlight}
-              onNote={id => setSelected(id === selected ? null : id)} editable />
+          {unsure.length > 0 && (
+            <div className="max-w-3xl mx-auto mb-4 flex flex-wrap items-center gap-x-4 gap-y-2 rounded-xl border border-[#f0c040]/20 bg-[#f0c040]/6 px-4 py-2.5 text-xs">
+              <span className="text-[#e8d9a8]">
+                {unsure.length} {unsure.length === 1 ? "note is" : "notes are"} unsure (faded) — worth a listen.
+              </span>
+              <span className="flex gap-3 ml-auto">
+                <button onClick={nextUnsure} className="text-[#f0c040] hover:text-[#f8cc50]">Check next</button>
+                <button onClick={removeUnsure} className="text-[#e07a62] hover:text-[#f08a70]">Remove all unsure</button>
+              </span>
+            </div>
+          )}
+          <div className={`rounded-2xl bg-white shadow-[0_24px_72px_rgba(0,0,0,0.6)] p-8 max-w-3xl mx-auto ${pending ? "ring-2 ring-[#f0c040]/60" : ""}`}>
+            <Renderer score={score} selected={selected} highlight={highlight} showConfidence
+              onNote={onNote} editable selectedHairpin={selectedHairpin} onHairpin={onHairpin} />
           </div>
-          <p className="text-center text-[#3c3850] text-xs mt-4">
-            {sel ? "↑ ↓ to move by semitone · shift for an octave · delete to remove" : "Tap any note to select and edit it"}
-          </p>
+          <p className="text-center text-[#3c3850] text-xs mt-4">{hint}</p>
         </div>
 
-        <div className="md:w-60 border-t md:border-t-0 md:border-l border-white/5 bg-[#060608] p-5 flex flex-col gap-5 shrink-0">
-          {sel ? (
+        <div className="md:w-72 border-t md:border-t-0 md:border-l border-white/5 bg-[#060608] p-5 flex flex-col gap-5 shrink-0 overflow-y-auto">
+          {pending ? (
+            <div className="flex flex-col gap-3 text-center">
+              <p className="text-[#f0c040] text-sm font-medium">
+                {pending.kind === "cresc" ? "Crescendo" : "Decrescendo"}
+              </p>
+              <p className="text-[#9490a0] text-[13px] leading-relaxed">
+                Tap the note where it ends. Tap the same note to cover just that one.
+              </p>
+              <Btn variant="ghost" onClick={() => setPending(null)} className="self-center">Cancel</Btn>
+            </div>
+          ) : sel ? (
             <>
               <div className="bg-[#0e0e12] rounded-xl p-3 border border-white/6 text-center">
                 <p style={{ fontFamily: "Fraunces,serif" }} className="text-[#f0c040] text-3xl font-light">{sel.pitch}</p>
                 <p className="text-[#5e5a70] text-[10px] mt-1">
                   bar {sel.measure + 1} · beat {(sel.beat + 1).toFixed(sel.beat % 1 ? 2 : 0)}
                 </p>
+                {isUnsure(sel) ? (
+                  <div className="mt-2 flex items-center justify-center gap-2 text-[11px]">
+                    <span className="text-[#e8b84a]">Unsure ({Math.round(sel.confidence * 100)}%)</span>
+                    <button onClick={markSure} className="text-[#9490a0] hover:text-[#f0ece4] underline underline-offset-2">
+                      It's right
+                    </button>
+                  </div>
+                ) : sel.confidence < 1 ? (
+                  <p className="text-[#5e5a70] text-[10px] mt-1">{Math.round(sel.confidence * 100)}% confident</p>
+                ) : null}
               </div>
 
               <div>
@@ -811,19 +948,95 @@ function EditScreen({ score, setScore, format, onBack, onContinue, onDelete }: {
                 </div>
               </div>
 
+              <div>
+                <p className="text-[#5e5a70] text-[10px] uppercase tracking-widest mb-2">Technique</p>
+                <div className="grid grid-cols-2 gap-1.5">
+                  {TECHNIQUES.map(t => {
+                    const on = sel.techniques.includes(t);
+                    return (
+                      <button key={t} onClick={() => toggle(t)} aria-pressed={on}
+                        className={`flex items-center justify-between rounded-lg px-2.5 py-1.5 text-xs border transition-colors ${on
+                          ? "bg-[#f0c040]/15 border-[#f0c040]/45 text-[#f0c040]"
+                          : "bg-white/4 border-white/8 text-[#b8b4c4] hover:bg-white/8"}`}>
+                        <span>{TECHNIQUE_INFO[t].label}</span>
+                        <span className="text-[9px] opacity-50">{TECHNIQUE_INFO[t].key}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+                {sel.techniques.includes("harmonic") && (
+                  <p className="text-[#5e5a70] text-[10px] mt-1.5">
+                    {(() => {
+                      const spot = naturalHarmonicFor(sel.midi);
+                      return spot
+                        ? `Natural harmonic: ${STANDARD_TUNING[spot.string].name} string, touch the ${spot.fret}th fret`
+                        : "No natural harmonic gives this pitch — it's played as an artificial harmonic";
+                    })()}
+                  </p>
+                )}
+              </div>
+
+              <div>
+                <p className="text-[#5e5a70] text-[10px] uppercase tracking-widest mb-2">Dynamics from here</p>
+                <div className="grid grid-cols-2 gap-1.5">
+                  <button onClick={() => startHairpin("cresc")}
+                    className="rounded-lg px-2.5 py-1.5 text-xs bg-white/4 border border-white/8 text-[#b8b4c4] hover:bg-white/8">
+                    𝆒 Crescendo
+                  </button>
+                  <button onClick={() => startHairpin("decresc")}
+                    className="rounded-lg px-2.5 py-1.5 text-xs bg-white/4 border border-white/8 text-[#b8b4c4] hover:bg-white/8">
+                    𝆓 Decrescendo
+                  </button>
+                </div>
+              </div>
+
               <button onClick={removeSelected}
                 className="text-[#e07a62] hover:text-[#f08a70] text-xs transition-colors self-start">
                 Remove this note
               </button>
             </>
-          ) : (
-            <div className="flex-1 flex flex-col items-center justify-center text-center gap-3">
-              <div className="w-12 h-12 rounded-2xl bg-white/5 flex items-center justify-center">
-                <Edit3 size={18} className="text-[#3c3850]" />
+          ) : hairpin ? (
+            <div className="flex flex-col gap-3">
+              <div className="bg-[#0e0e12] rounded-xl p-3 border border-white/6 text-center">
+                <p style={{ fontFamily: "Fraunces,serif" }} className="text-[#f0c040] text-2xl font-light">
+                  {hairpin.kind === "cresc" ? "Crescendo" : "Decrescendo"}
+                </p>
+                <p className="text-[#5e5a70] text-[10px] mt-1">{describeSpan(hairpin)}</p>
               </div>
-              <p className="text-[#3c3850] text-[13px] leading-relaxed">
-                Select a note in the score to change its pitch.
-              </p>
+              <Btn variant="secondary" onClick={() => flipHairpin(hairpin.id)} className="justify-center">
+                Make it a {hairpin.kind === "cresc" ? "decrescendo" : "crescendo"}
+              </Btn>
+              <button onClick={() => removeHairpin(hairpin.id)}
+                className="text-[#e07a62] hover:text-[#f08a70] text-xs transition-colors self-start">
+                Remove this marking
+              </button>
+            </div>
+          ) : (
+            <div className="flex flex-col gap-4">
+              <div className="flex flex-col items-center text-center gap-3 pt-4">
+                <div className="w-12 h-12 rounded-2xl bg-white/5 flex items-center justify-center">
+                  <Edit3 size={18} className="text-[#3c3850]" />
+                </div>
+                <p className="text-[#3c3850] text-[13px] leading-relaxed">
+                  Select a note to change its pitch, mark a technique, or start a crescendo or decrescendo.
+                </p>
+              </div>
+              {score.hairpins.length > 0 && (
+                <div>
+                  <p className="text-[#5e5a70] text-[10px] uppercase tracking-widest mb-2">Dynamics</p>
+                  <div className="flex flex-col gap-1">
+                    {score.hairpins.map(h => (
+                      <div key={h.id} className="flex items-center justify-between text-xs rounded-lg bg-white/4 px-2.5 py-1.5">
+                        <button onClick={() => onHairpin(h.id)} className="text-[#b8b4c4] hover:text-[#f0ece4]">
+                          {h.kind === "cresc" ? "Crescendo" : "Decrescendo"} · {describeSpan(h)}
+                        </button>
+                        <button onClick={() => removeHairpin(h.id)} aria-label="Remove"
+                          className="text-[#5e5a70] hover:text-[#e07a62]">✕</button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
@@ -872,18 +1085,11 @@ function DownloadScreen({ format, jobId, score, instrument, onFinish }: {
     try {
       const label = finalName();
       if (format === "midi") {
-        // Prefer the backend's MIDI (it carries basic-pitch's pitch bends); if
-        // that job has expired, rebuild the file from the notes we hold.
-        try {
-          if (!jobId) throw new Error("no job");
-          await downloadTranscription(jobId, "midi", `${label}.mid`);
-        } catch {
-          const url = URL.createObjectURL(notesToMidiBlob(
-            score.events.filter(e => e.kind === "note").map(e => ({ start: e.start, end: e.end, midi: e.midi }))
-          ));
-          triggerDownload(url, `${label}.mid`);
-          setTimeout(() => URL.revokeObjectURL(url), 3000);
-        }
+        // Built from the score as edited — note fixes, removed notes and the
+        // crescendo / decrescendo velocities all end up in the file.
+        const url = URL.createObjectURL(notesToMidiBlob(midiNotesOf(score)));
+        triggerDownload(url, `${label}.mid`);
+        setTimeout(() => URL.revokeObjectURL(url), 3000);
       } else {
         if (!jobId) throw new Error("The audio for this take is no longer on the server. Record again to export WAV.");
         await downloadTranscription(jobId, "wav", `${label}.wav`);
@@ -984,16 +1190,15 @@ function ProjectScreen({ record, onBack, onDelete, onRename }: {
   const [highlight, setHighlight] = useState<number[]>([]);
   const wrapRef = useRef<HTMLDivElement>(null);
 
-  const score = useMemo(() => buildScoreFromStoredNotes(record.notes), [record.notes]);
+  const score = useMemo(() => buildScoreFromStoredNotes(record.notes, record.hairpins),
+    [record.notes, record.hairpins]);
   const Renderer = view === "tab" ? TabSVG : SheetSVG;
   const onHighlight = useCallback((ids: number[]) => setHighlight(ids), []);
 
   function exportMidi() {
     setError(null);
     try {
-      const url = URL.createObjectURL(notesToMidiBlob(
-        score.events.filter(e => e.kind === "note").map(e => ({ start: e.start, end: e.end, midi: e.midi }))
-      ));
+      const url = URL.createObjectURL(notesToMidiBlob(midiNotesOf(score)));
       triggerDownload(url, `${record.name}.mid`);
       setTimeout(() => URL.revokeObjectURL(url), 3000);
     } catch (err) {
@@ -1183,6 +1388,7 @@ export default function App() {
       durationSeconds: recDuration,
       color: CARD_PALETTE[projects.length % CARD_PALETTE.length],
       notes: toStoredNotes(score.events),
+      hairpins: toStoredHairpins(score.hairpins),
       bpm: score.tempo.bpm,
     });
     resetSession();
@@ -1286,3 +1492,4 @@ export default function App() {
     </div>
   );
 }
+

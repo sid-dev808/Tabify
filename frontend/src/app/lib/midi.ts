@@ -28,6 +28,7 @@ export interface MidiNote {
   start: number;   // seconds
   end: number;     // seconds
   midi: number;    // MIDI note number
+  velocity?: number; // 1-127; defaults to 100
 }
 
 export function notesToMidiBytes(notes: MidiNote[]): Uint8Array {
@@ -39,7 +40,8 @@ export function notesToMidiBytes(notes: MidiNote[]): Uint8Array {
     const onTick = Math.max(0, Math.round(note.start * TICKS_PER_SECOND));
     // Every note needs at least one tick of length or it won't sound at all.
     const offTick = Math.max(onTick + 1, Math.round(note.end * TICKS_PER_SECOND));
-    events.push({ tick: onTick, order: 1, bytes: [0x90, pitch, 0x64] });
+    const velocity = Math.max(1, Math.min(127, Math.round(note.velocity ?? 100)));
+    events.push({ tick: onTick, order: 1, bytes: [0x90, pitch, velocity] });
     events.push({ tick: offTick, order: 0, bytes: [0x80, pitch, 0x40] });
   }
 

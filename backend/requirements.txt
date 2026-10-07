@@ -28,3 +28,9 @@ basic-pitch
 # app.py selects it explicitly. Keep this pinned here even though basic-pitch
 # does not ask for it.
 onnxruntime
+
+# SwiftF0 pitch tracker (MIT, ONNX, ~120 KB): a second opinion on every note,
+# used for confidence scores, missed notes and vibrato/hammer-on/pull-off
+# detection. soxr resamples to its 16 kHz input (librosa already pulls it in).
+swift-f0==0.3.0
+soxr

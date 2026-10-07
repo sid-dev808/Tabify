@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef } from "react";
 import {
-  CONTENT_X0, CONTENT_X1, MEASURES_PER_SYSTEM, MEASURE_W, STANDARD_TUNING,
-  assignFrets, isSharp, measureX, staffTop, tabTop,
+  BEATS_PER_MEASURE, CONTENT_X0, CONTENT_X1, MEASURES_PER_SYSTEM, MEASURE_W, STANDARD_TUNING,
+  assignFrets, hairpinSegments, isSharp, isUnsure, legatoSource, measureX, staffTop, tabTop,
   type Glyph, type LaidOutEvent, type Score,
 } from "../lib/score";
 
@@ -84,6 +84,75 @@ export interface ScoreProps {
   title?: string;
   /** Event ids currently sounding during playback. */
   highlight?: number[];
+  /** Fade notes the transcriber was unsure of (editor and review only, never exports). */
+  showConfidence?: boolean;
+  selectedHairpin?: number | null;
+  onHairpin?: (id: number) => void;
+}
+
+const UNSURE_OPACITY = 0.42;
+
+/** How wide a note's duration is on the page, for vibrato lines. */
+function durationWidth(e: LaidOutEvent) {
+  const usable = MEASURE_W - 22;
+  return Math.max(14, (Math.min(e.beats, BEATS_PER_MEASURE) / BEATS_PER_MEASURE) * usable - 4);
+}
+
+/** A wavy vibrato line starting at x. */
+function VibratoLine({ x, y, width, col }: { x: number; y: number; width: number; col: string }) {
+  const end = Math.min(CONTENT_X1 - 2, x + width);
+  let d = `M ${x} ${y}`;
+  for (let px = x, up = true; px < end; px += 3, up = !up) d += ` q 1.5 ${up ? -2.6 : 2.6} 3 0`;
+  return <path d={d} fill="none" stroke={col} strokeWidth="1.1" strokeLinecap="round" />;
+}
+
+/** Slur arc for a hammer-on or pull-off, with its H / P letter. */
+function LegatoArc({ x0, y0, x1, y1, label, col, size = 7, below = false }: {
+  x0: number; y0: number; x1: number; y1: number; label: string; col: string; size?: number;
+  below?: boolean;
+}) {
+  const lift = Math.min(10, 4 + Math.abs(x1 - x0) * 0.1);
+  const dir = below ? 1 : -1;
+  const edge = below ? Math.max(y0, y1) : Math.min(y0, y1);
+  const ctrl = edge + dir * lift * 1.6;
+  return (
+    <g>
+      <path d={`M ${x0} ${y0} Q ${(x0 + x1) / 2} ${ctrl} ${x1} ${y1}`}
+        fill="none" stroke={col} strokeWidth="1.1" />
+      <text x={(x0 + x1) / 2} y={below ? edge + lift + size + 2 : edge - lift - 2} textAnchor="middle"
+        fontSize={size} fontFamily="Figtree, sans-serif" fontWeight="700" fill={col}>{label}</text>
+    </g>
+  );
+}
+
+/** Crescendo / decrescendo wedges under each system. */
+function Hairpins({ score, yOffset, maxOffset = yOffset, clampLow = false, topOf, selected, onHairpin, editable }: {
+  score: Score; yOffset: number; maxOffset?: number; clampLow?: boolean; topOf: (sys: number) => number;
+  selected?: number | null; onHairpin?: (id: number) => void; editable?: boolean;
+}) {
+  const H = 6;
+  return (
+    <>
+      {score.hairpins.flatMap(h => hairpinSegments(h, score).map((seg, i) => {
+        // Drop below any low notes (ledger lines) the wedge runs under.
+        const under = score.events.filter(e => e.kind === "note" && e.sys === seg.sys
+          && e.x >= seg.x0 - 8 && e.x <= seg.x1 + 8);
+        const lowest = clampLow ? Math.max(0, ...under.map(e => e.y)) : 0;
+        const y = topOf(seg.sys) + Math.min(maxOffset, Math.max(yOffset, lowest + 16));
+        const open0 = (h.kind === "cresc" ? seg.from : 1 - seg.from) * H;
+        const open1 = (h.kind === "cresc" ? seg.to : 1 - seg.to) * H;
+        const col = h.id === selected ? ACCENT : "#555";
+        return (
+          <g key={`${h.id}-${i}`} onClick={() => editable && onHairpin?.(h.id)}
+            style={{ cursor: editable ? "pointer" : "default" }}>
+            <rect x={seg.x0 - 3} y={y - H - 4} width={seg.x1 - seg.x0 + 6} height={2 * H + 8} fill="transparent" />
+            <line x1={seg.x0} y1={y - open0} x2={seg.x1} y2={y - open1} stroke={col} strokeWidth="1.2" />
+            <line x1={seg.x0} y1={y + open0} x2={seg.x1} y2={y + open1} stroke={col} strokeWidth="1.2" />
+          </g>
+        );
+      }))}
+    </>
+  );
 }
 
 const INK = "#2a2828";
@@ -212,9 +281,10 @@ function Rest({ glyph, x, top, col }: { glyph: Glyph; x: number; top: number; co
 /* ─── SHEET MUSIC ─── */
 export function SheetSVG({
   score, revealed, selected = null, onNote, editable, title = "Transcribed Score", highlight,
+  showConfidence, selectedHairpin = null, onHairpin,
 }: ScoreProps) {
   const shown = revealed ?? score.events.length;
-  const height = staffTop(score.systems - 1) + 92;
+  const height = staffTop(score.systems - 1) + 112;
   const playing = useMemo(() => new Set(highlight ?? []), [highlight]);
 
   /* Notes sharing a measure and beat are one chord: they get stacked
@@ -262,11 +332,27 @@ export function SheetSVG({
         const stemFrom = top + (stemUp ? maxY - 1 : minY + 1);
         const stemTo = top + (stemUp ? minY - 31 : maxY + 31);
         const flags = FLAGS[glyph];
+        const faded = showConfidence && group.every(n => isUnsure(n));
+        const tremolo = group.some(n => n.techniques?.includes("tremolo"));
+        const vibrato = group.find(n => n.techniques?.includes("vibrato"));
+        const markY = Math.min(top - 11, top + minY - 13, stemUp ? stemTo - 6 : top - 11);
 
         return (
           <g key={`${group[0].measure}:${group[0].beat}`}
             onClick={() => editable && onNote?.(group[0].id)}
+            opacity={faded ? UNSURE_OPACITY : 1}
             style={{ cursor: editable ? "pointer" : "default" }}>
+
+            {vibrato && <VibratoLine x={cx - 4} y={markY} width={durationWidth(vibrato)} col={col} />}
+            {tremolo && (() => {
+              // Three slashes through the stem (above the head on a stemless note).
+              const midY = HAS_STEM[glyph] ? (stemFrom + stemTo) / 2 : top + minY - 12;
+              const sx = HAS_STEM[glyph] ? stemX : cx;
+              return [0, 1, 2].map(i => (
+                <line key={i} x1={sx - 4} y1={midY + 3 + (i - 1) * 4} x2={sx + 4} y2={midY - 1 + (i - 1) * 4}
+                  stroke={col} strokeWidth="1.6" />
+              ));
+            })()}
 
             {HAS_STEM[glyph] && (
               <line x1={stemX} y1={stemFrom} x2={stemX} y2={stemTo} stroke={col} strokeWidth="1.5" />
@@ -284,8 +370,22 @@ export function SheetSVG({
 
             {group.map(note => {
               const cy = top + note.y;
+              const harmonic = note.techniques?.includes("harmonic");
+              const legato = note.techniques?.find(t => t === "hammer_on" || t === "pull_off");
+              const source = legato ? legatoSource(score.events.slice(0, shown), note) : null;
               return (
-                <g key={note.id}>
+                <g key={note.id} opacity={showConfidence && !faded && isUnsure(note) ? UNSURE_OPACITY : 1}>
+                  {legato && (() => {
+                    // The slur sits on the notehead side, away from the stems.
+                    const label = legato === "hammer_on" ? "H" : "P";
+                    const off = stemUp ? 6 : -6;
+                    if (source && source.sys === note.sys && source.x < cx) {
+                      return <LegatoArc x0={source.x + 1} y0={top + source.y + off} x1={cx - 1} y1={cy + off}
+                        label={label} col={col} size={8} below={stemUp} />;
+                    }
+                    return <LegatoArc x0={cx - 20} y0={cy + off} x1={cx - 1} y1={cy + off} label={label}
+                      col={col} size={8} below={stemUp} />;
+                  })()}
                   {(note.id === selected || playing.has(note.id)) && (
                     <circle cx={cx} cy={cy} r="11" fill={col} opacity="0.18" />
                   )}
@@ -293,10 +393,16 @@ export function SheetSVG({
                   {isSharp(note.midi) && (
                     <text x={cx - 13} y={cy + 4} fontSize="11" fill={col} fontFamily="serif">♯</text>
                   )}
-                  <ellipse cx={cx} cy={cy} rx="6.2" ry="4.6"
-                    fill={OPEN_HEAD[glyph] ? "none" : col} stroke={col}
-                    strokeWidth={OPEN_HEAD[glyph] ? "1.7" : "0"}
-                    transform={`rotate(-18 ${cx} ${cy})`} />
+                  {harmonic ? (
+                    // Natural harmonic: a diamond notehead.
+                    <path d={`M ${cx - 6} ${cy} L ${cx} ${cy - 5} L ${cx + 6} ${cy} L ${cx} ${cy + 5} Z`}
+                      fill="white" stroke={col} strokeWidth="1.5" />
+                  ) : (
+                    <ellipse cx={cx} cy={cy} rx="6.2" ry="4.6"
+                      fill={OPEN_HEAD[glyph] ? "none" : col} stroke={col}
+                      strokeWidth={OPEN_HEAD[glyph] ? "1.7" : "0"}
+                      transform={`rotate(-18 ${cx} ${cy})`} />
+                  )}
                   {DOTTED[glyph] && (
                     <circle cx={cx + 11} cy={note.y % 12 === 0 ? cy - 3 : cy} r="1.4" fill={col} />
                   )}
@@ -306,6 +412,9 @@ export function SheetSVG({
           </g>
         );
       })}
+
+      <Hairpins score={score} yOffset={68} maxOffset={104} clampLow topOf={staffTop} selected={selectedHairpin}
+        onHairpin={onHairpin} editable={editable} />
     </svg>
   );
 }
@@ -313,6 +422,7 @@ export function SheetSVG({
 /* ─── GUITAR TAB ─── */
 export function TabSVG({
   score, revealed, selected = null, onNote, editable, title = "Guitar Tablature", highlight,
+  showConfidence, selectedHairpin = null, onHairpin,
 }: ScoreProps) {
   const shown = revealed ?? score.events.length;
   const height = tabTop(score.systems - 1) + 76;
@@ -334,24 +444,48 @@ export function TabSVG({
           measures={Math.min(MEASURES_PER_SYSTEM, score.measures - si * MEASURES_PER_SYSTEM)} />
       ))}
 
-      {assigned.map(({ event, string, fret }) => {
+      {assigned.map(({ event, string, fret, harmonic }) => {
         const top = tabTop(event.sys);
         const cy = top + string * 10;
         const isSel = event.id === selected;
         const isPlaying = playing.has(event.id);
         const col = isSel ? ACCENT : isPlaying ? PLAYING : INK;
+        const label = harmonic ? `<${fret}>` : String(fret);
+        const w = 6 + label.length * 5.5;
+        const legato = event.techniques?.find(t => t === "hammer_on" || t === "pull_off");
+        const source = legato ? legatoSource(score.events.slice(0, shown), event) : null;
+        const sourceSpot = source ? assigned.find(a => a.event.id === source.id) : undefined;
 
         return (
           <g key={event.id}
             onClick={() => editable && onNote?.(event.id)}
+            opacity={showConfidence && isUnsure(event) ? UNSURE_OPACITY : 1}
             style={{ cursor: editable ? "pointer" : "default" }}>
             {(isSel || isPlaying) && <circle cx={event.x} cy={cy} r="9" fill={col} opacity="0.22" />}
-            <rect x={event.x - 7.5} y={cy - 6} width="15" height="12" fill="white" />
+            {legato && (() => {
+              const letter = legato === "hammer_on" ? "h" : "p";
+              if (sourceSpot && source && source.sys === event.sys && source.x < event.x) {
+                const sy = top + sourceSpot.string * 10;
+                return <LegatoArc x0={source.x + 3} y0={sy - 6} x1={event.x - 3} y1={cy - 6} label={letter} col={col} size={7.5} />;
+              }
+              return <LegatoArc x0={event.x - 18} y0={cy - 6} x1={event.x - 3} y1={cy - 6} label={letter} col={col} size={7.5} />;
+            })()}
+            {event.techniques?.includes("vibrato") && (
+              <VibratoLine x={event.x - 4} y={top - 9} width={durationWidth(event)} col={col} />
+            )}
+            {event.techniques?.includes("tremolo") && [0, 1, 2].map(i => (
+              <line key={i} x1={event.x - 4 + i * 3} y1={top + 59} x2={event.x - 1 + i * 3} y2={top + 53}
+                stroke={col} strokeWidth="1.3" />
+            ))}
+            <rect x={event.x - w / 2} y={cy - 6} width={w} height="12" fill="white" />
             <text x={event.x} y={cy + 3.5} textAnchor="middle" fontSize="9.5"
-              fontFamily="Figtree, sans-serif" fontWeight="600" fill={col}>{fret}</text>
+              fontFamily="Figtree, sans-serif" fontWeight="600" fill={col}>{label}</text>
           </g>
         );
       })}
+
+      <Hairpins score={score} yOffset={67} topOf={tabTop} selected={selectedHairpin}
+        onHairpin={onHairpin} editable={editable} />
     </svg>
   );
 }
